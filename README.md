@@ -6,6 +6,11 @@ A clean web UI for HashiCorp Vault: browse and edit secrets, inspect policies, l
 - **Secrets**: KV v1/v2 browser with masked values (reveal/copy), version history, **path search**, and **create / edit / delete**. In KV v2, delete is a soft delete of the latest version and editing saves a new version.
 - **Policies**: parsed rules per path with capabilities. Broad rules (`sudo`, `*`, write+delete on wildcards) are flagged.
 - **Auth methods** and **Leases**: list backends, browse lease prefixes with TTL/expiry.
+- **Expiry**: one list of everything that expires, sorted by date, with expired / critical (≤7d) / warning (configurable window) status and a counter on the Overview page.
+  - **Tokens**: from token accessors (`expire_time`).
+  - **Certificates**: every non-revoked certificate and the issuing CA of each PKI mount (parsed from the PEM).
+  - **AppRole**: secret IDs of each role. A role-id itself never expires, so roles whose secret IDs never expire are listed in the notes instead.
+  - Checks are capped (200 tokens, 200 certs per mount, 100 roles, 100 secret IDs per role) and the page says when something was skipped.
 - **Audit**: scans for root tokens, tokens without expiry, overly broad policy rules and stale KV v2 secrets (configurable age). Limited to what the signed-in token may read; skipped areas are listed.
 
 The browser holds your Vault token only in `sessionStorage`. The backend is a thin proxy that forwards it per request and stores nothing.

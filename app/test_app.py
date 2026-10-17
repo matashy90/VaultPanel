@@ -71,3 +71,30 @@ def test_write_requires_token():
     assert r.status_code == 401
     assert client.get("/api/audit").status_code == 401
     assert client.get("/api/kv/search?mount=secret&q=a").status_code == 401
+
+
+def test_expiry_status_and_cert_info():
+    from datetime import datetime, timedelta, timezone
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    from vault import cert_info, expiry_status
+
+    assert [expiry_status(d, 30) for d in (-1, 0, 7, 8, 30, 31)] == [
+        "expired", "critical", "critical", "warning", "warning", "ok"]
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "svc.example.com")])
+    end = datetime.now(timezone.utc) + timedelta(days=10)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(1)
+            .not_valid_before(datetime.now(timezone.utc) - timedelta(days=1)).not_valid_after(end)
+            .sign(key, hashes.SHA256()))
+    cn, exp = cert_info(cert.public_bytes(serialization.Encoding.PEM).decode())
+    assert cn == "svc.example.com" and abs((exp - end).total_seconds()) < 2
+
+
+def test_expiry_requires_token():
+    assert client.get("/api/expiry").status_code == 401

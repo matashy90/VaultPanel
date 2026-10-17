@@ -87,6 +87,27 @@ def walk_kv(mount: str, v2: bool, token: str, limit: int = 500, max_depth: int =
     return sorted(found), False
 
 
+def cert_info(pem: str) -> tuple[str, datetime]:
+    """Returns (common name, expiry) of a PEM certificate."""
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+
+    cert = x509.load_pem_x509_certificate(pem.encode())
+    cns = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    name = str(cns[0].value) if cns else cert.subject.rfc4514_string() or "(no subject)"
+    return name, cert.not_valid_after_utc
+
+
+def expiry_status(days_left: int, warn_days: int) -> str:
+    if days_left < 0:
+        return "expired"
+    if days_left <= 7:
+        return "critical"
+    if days_left <= warn_days:
+        return "warning"
+    return "ok"
+
+
 def parse_policy(hcl: str) -> list[dict]:
     """Extracts path blocks and their capabilities from an ACL policy."""
     rules = []

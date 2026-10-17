@@ -86,7 +86,7 @@ async function renderLogin(error) {
 
 // ---------- Shell ----------
 const NAV = [["overview", "Overview"], ["secrets", "Secrets"], ["policies", "Policies"],
-  ["auth", "Auth methods"], ["leases", "Leases"], ["audit", "Audit"]];
+  ["auth", "Auth methods"], ["leases", "Leases"], ["expiry", "Expiry"], ["audit", "Audit"]];
 
 function shell(content) {
   const nav = NAV.map(([k, label]) =>
@@ -130,6 +130,9 @@ const views = {
     const { me, health, mounts } = state;
     const ttl = me.ttl;
     const policies = me.policies || [];
+    let expiring = null;
+    try { expiring = (await api("/expiry")).counts; } catch {}
+    const attention = expiring ? expiring.expired + expiring.critical + expiring.warning : null;
     return h("div", {},
       h("h2", {}, "Overview"),
       h("div", { class: "grid" },
@@ -137,7 +140,11 @@ const views = {
         stat("Version", health.version || "?"),
         stat("Cluster", health.cluster_name || "-"),
         stat("Secret engines", Object.keys(mounts.secret).length),
-        stat("Auth methods", Object.keys(mounts.auth).length)),
+        stat("Auth methods", Object.keys(mounts.auth).length),
+        attention !== null && h("div", { class: "stat", style: "cursor:pointer", onclick: () => go("expiry") },
+          h("small", {}, "Expiring ≤30d / expired"),
+          h("strong", { class: `badge ${expiring.expired + expiring.critical ? "bad" : attention ? "warn" : "ok"}`,
+            style: "font-size:16px" }, attention))),
       h("div", { class: "card" },
         h("h3", {}, "Your token"),
         h("table", {}, h("tbody", {},
@@ -238,6 +245,46 @@ const views = {
       h("p", { class: "empty" }, "No leases at this level.")));
     return root;
   },
+  async expiry() {
+    const days = state.warnDays || 30;
+    const kind = state.expiryKind || "all";
+    const r = await api(`/expiry?${q({ warn_days: days })}`);
+    const tone = { expired: "bad", critical: "bad", warning: "warn", ok: "ok" };
+    const KIND = { token: "Token", certificate: "Certificate", approle: "AppRole" };
+    const shown = r.items.filter((i) => kind === "all" || i.kind === kind);
+    const select = h("select", { onchange: (e) => { state.warnDays = Number(e.target.value); render(); } },
+      [14, 30, 60, 90].map((d) => h("option", { value: d, selected: d === days }, `${d} days`)));
+    const when = (i) => {
+      const ms = new Date(i.expires) - Date.now();
+      const hrs = Math.floor(Math.abs(ms) / 36e5);
+      const span = hrs < 48 ? `${hrs}h` : `${Math.floor(hrs / 24)}d`;
+      return ms < 0 ? `expired ${span} ago` : `in ${span}`;
+    };
+    return h("div", {},
+      h("div", { class: "row between" }, h("h2", {}, "Expiry"),
+        h("label", { class: "row", style: "color:var(--muted)" }, "Warn within", select)),
+      h("div", { class: "grid" },
+        stat("Expired", r.counts.expired, r.counts.expired ? "bad" : "ok"),
+        stat("Critical (≤7d)", r.counts.critical, r.counts.critical ? "bad" : "ok"),
+        stat(`Warning (≤${days}d)`, r.counts.warning, r.counts.warning ? "warn" : "ok"),
+        stat("Healthy", r.counts.ok, "ok")),
+      r.notes.map((n) => h("div", { class: "card", style: "color:var(--muted)" }, "ℹ ", n)),
+      h("div", { class: "card" },
+        h("div", { class: "tabs row", style: "margin-bottom:12px" },
+          ["all", "token", "certificate", "approle"].map((k) => h("button", {
+            class: `btn ${k === kind ? "primary" : ""}`,
+            onclick: () => { state.expiryKind = k; render(); },
+          }, k === "all" ? "All" : KIND[k]))),
+        shown.length ? h("table", {},
+          h("thead", {}, h("tr", {}, ["Status", "Type", "Name", "Source", "Expires"].map((c) => h("th", {}, c)))),
+          h("tbody", {}, shown.map((i) => h("tr", {},
+            h("td", {}, h("span", { class: `badge ${tone[i.status]}` }, i.status)),
+            h("td", {}, KIND[i.kind]), h("td", {}, h("strong", {}, i.name)),
+            h("td", { style: "color:var(--muted)" }, i.source),
+            h("td", {}, `${fmtDate(i.expires)} (${when(i)})`)))))
+          : h("p", { class: "empty" }, "Nothing with an expiry date found.")));
+  },
+
   async audit() {
     const days = state.staleDays || 90;
     const r = await api(`/audit?${q({ stale_days: days })}`);

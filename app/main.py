@@ -7,7 +7,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from vault import call, clean_path, list_keys, parse_policy, parse_time, readonly, vault_addr, walk_kv
+from vault import (call, cert_info, clean_path, expiry_status, list_keys, parse_policy, parse_time,
+                   readonly, vault_addr, walk_kv)
 
 app = FastAPI(title="Vault Dashboard")
 
@@ -235,6 +236,95 @@ def audit(stale_days: int = 90, t: str = Depends(token)):
     order = {"high": 0, "medium": 1, "low": 2}
     findings.sort(key=lambda f: (order[f["severity"]], f["category"], f["title"]))
     return {"findings": findings, "notes": notes, "stats": stats, "stale_days": stale_days}
+
+
+@app.get("/api/expiry")
+def expiry(warn_days: int = 30, t: str = Depends(token)):
+    """Expiry of tokens, PKI certificates and AppRole secret IDs."""
+    now = datetime.now(timezone.utc)
+    items: list[dict] = []
+    notes: list[str] = []
+
+    def add(kind: str, name: str, source: str, expires: datetime | None) -> None:
+        if expires is None:
+            return
+        days = (expires - now).days if expires > now else -((now - expires).days + 1)
+        items.append({"kind": kind, "name": name, "source": source,
+                      "expires": expires.isoformat(), "days_left": days,
+                      "status": expiry_status(days, warn_days)})
+
+    try:
+        accessors = list_keys("auth/token/accessors", t)
+        for acc in accessors[:200]:
+            try:
+                info = call("POST", "auth/token/lookup-accessor", t, {"accessor": acc})["data"]
+            except HTTPException:
+                continue
+            add("token", info.get("display_name") or "token",
+                f"accessor {acc} · {', '.join(info.get('policies') or [])}",
+                parse_time(info.get("expire_time")))
+        if len(accessors) > 200:
+            notes.append("Only the first 200 tokens were checked.")
+    except HTTPException as e:
+        notes.append(f"Tokens not checked: {e.detail}")
+
+    ui = call("GET", "sys/internal/ui/mounts", t)["data"]
+    for mount, info in ui.get("secret", {}).items():
+        if info.get("type") != "pki":
+            continue
+        mname = mount.strip("/")
+        seen: set[tuple[str, datetime]] = set()
+        try:
+            serials = list_keys(f"{mname}/certs", t)
+            if len(serials) > 200:
+                notes.append(f"Only the first 200 certificates in '{mount}' were checked.")
+            for serial in serials[:200]:
+                data = call("GET", f"{mname}/cert/{clean_path(serial)}", t)["data"]
+                if data.get("revocation_time"):
+                    continue
+                cn, exp = cert_info(data["certificate"])
+                seen.add((cn, exp))
+                add("certificate", cn, f"{mname} · serial {serial}", exp)
+            ca = call("GET", f"{mname}/cert/ca", t).get("data", {}).get("certificate")
+            if ca:
+                cn, exp = cert_info(ca)
+                if (cn, exp) not in seen:
+                    add("certificate", f"{cn} (CA)", f"{mname} · issuing CA", exp)
+        except HTTPException as e:
+            notes.append(f"Certificates in '{mount}' not checked: {e.detail}")
+        except Exception as e:
+            notes.append(f"Certificates in '{mount}' could not be parsed: {e}")
+
+    for mount, info in ui.get("auth", {}).items():
+        if info.get("type") != "approle":
+            continue
+        mname = mount.strip("/")
+        try:
+            roles = list_keys(f"auth/{mname}/role", t)
+            if len(roles) > 100:
+                notes.append(f"Only the first 100 AppRoles in '{mount}' were checked.")
+            for role in roles[:100]:
+                r = clean_path(role)
+                accs = list_keys(f"auth/{mname}/role/{r}/secret-id", t)
+                never = 0
+                for acc in accs[:100]:
+                    try:
+                        sid = call("POST", f"auth/{mname}/role/{r}/secret-id-accessor/lookup", t,
+                                   {"secret_id_accessor": acc})["data"]
+                    except HTTPException:
+                        continue
+                    exp = parse_time(sid.get("expiration_time"))
+                    if exp is None:
+                        never += 1
+                    add("approle", f"{role} secret ID", f"{mname} · accessor {acc}", exp)
+                if never:
+                    notes.append(f"AppRole '{role}' has {never} secret ID(s) that never expire.")
+        except HTTPException as e:
+            notes.append(f"AppRoles in '{mount}' not checked: {e.detail}")
+
+    items.sort(key=lambda i: i["expires"])
+    counts = {s: sum(1 for i in items if i["status"] == s) for s in ("expired", "critical", "warning", "ok")}
+    return {"items": items, "counts": counts, "notes": notes, "warn_days": warn_days}
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
