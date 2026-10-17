@@ -1,4 +1,4 @@
-# OnePane: Vault Dashboard
+# Vault Dashboard
 
 A clean web UI for HashiCorp Vault: browse and edit secrets, inspect policies, look at leases and audit your setup.
 
