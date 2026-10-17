@@ -16,6 +16,8 @@ class Cluster:
     cacert: str = ""
     namespace: str = ""
     monitor_token: str = ""
+    oidc_mount: str = ""
+    oidc_role: str = ""
 
     @property
     def verify(self) -> bool | str:
@@ -47,6 +49,8 @@ def load_clusters() -> list[Cluster]:
             addr=os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200").rstrip("/"),
             cacert=os.environ.get("VAULT_CACERT", ""),
             monitor_token=os.environ.get("VAULT_MONITOR_TOKEN", "").strip(),
+            oidc_mount=os.environ.get("VAULT_OIDC_MOUNT", "").strip("/"),
+            oidc_role=os.environ.get("VAULT_OIDC_ROLE", ""),
         )
         return [default]
     entries = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -62,7 +66,9 @@ def load_clusters() -> list[Cluster]:
         seen.add(name)
         clusters.append(Cluster(name=name, addr=e["addr"].rstrip("/"), cacert=e.get("cacert", ""),
                                 namespace=e.get("namespace", "").strip("/"),
-                                monitor_token=_secret(e)))
+                                monitor_token=_secret(e),
+                                oidc_mount=str(e.get("oidc_mount", os.environ.get("VAULT_OIDC_MOUNT", ""))).strip("/"),
+                                oidc_role=str(e.get("oidc_role", os.environ.get("VAULT_OIDC_ROLE", "")))))
     return clusters
 
 

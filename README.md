@@ -41,6 +41,19 @@ Uses `VAULT_ADDR` (default `http://host.docker.internal:8200`) and publishes on 
 ## Namespaces (Vault Enterprise / HCP)
 Type the namespace (e.g. `admin` or `admin/team-a`) in the sidebar field. It is sent as `X-Vault-Namespace` with every request, and child namespaces are suggested when the token can list them. Leave it empty for the root namespace. Open source Vault has no namespaces and ignores the header. Namespace support is covered by unit tests only; it has not been tried against an Enterprise or HCP instance.
 
+## OIDC login
+
+If your Vault has an OIDC auth method, users can sign in with their company identity instead of pasting a token. The browser is sent to the identity provider and comes back to the dashboard, which exchanges the code for a Vault token through Vault's own OIDC callback. No client secret is ever stored in the dashboard; it stays in Vault.
+
+1. Vault: enable and configure `auth/oidc` and create a role. The role's `allowed_redirect_uris` must contain the dashboard address **with a trailing slash**, e.g. `https://vault-dash.example.com/` (the callback is the dashboard root, `http://127.0.0.1:8080/` locally).
+2. Dashboard: set `VAULT_OIDC_MOUNT` (the auth mount path, usually `oidc`) and optionally `VAULT_OIDC_ROLE`. Without a role Vault uses the mount's `default_role`.
+3. Per cluster you can set `"oidc_mount"` and `"oidc_role"` in `VAULT_CLUSTERS_FILE`; they override the variables.
+4. `VAULT_LOGIN_TOKEN=off` hides the token box so only OIDC remains.
+
+For a namespace, set the namespace first in the cluster entry (`"namespace"`), because the OIDC mount is looked up in it. Sessions last as long as the token TTL issued by the role.
+
+Tested locally against Keycloak 26 with Vault 1.18: sign-in returns a token with the role's policies, and reusing a code or a wrong nonce is rejected by Vault.
+
 ## Several Vaults (fleet monitoring)
 List the clusters in a JSON file and point `VAULT_CLUSTERS_FILE` at it (see [clusters.example.json](clusters.example.json)); without it a single cluster is taken from `VAULT_ADDR`.
 

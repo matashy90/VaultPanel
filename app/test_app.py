@@ -408,3 +408,39 @@ def test_scan_job_is_private_to_the_token(monkeypatch):
     assert "token-a" not in repr(scan.JOBS.keys())      # only a hash is used as the key
     assert scan.get_job("expiry", "token-b") == {"state": "none"}
     scan.JOBS.clear()
+
+
+def test_oidc_login_flow(monkeypatch):
+    import httpx
+    import vault
+
+    monkeypatch.setenv("VAULT_OIDC_MOUNT", "oidc")
+    monkeypatch.setenv("VAULT_OIDC_ROLE", "admins")
+    seen = []
+
+    def fake(method, url, **kw):
+        seen.append((method, url, kw.get("json"), kw["headers"]))
+        if url.endswith("/oidc/auth_url"):
+            body = {"data": {"auth_url": "https://idp.example/auth?state=s1"}}
+        else:
+            body = {"auth": {"client_token": "hvs.new", "policies": ["default"], "lease_duration": 3600, "renewable": True}}
+        return httpx.Response(200, json=body, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(vault, "_http", fake)
+    listed = client.get("/api/clusters").json()
+    assert listed["clusters"][0]["oidc"] and listed["clusters"][0]["oidc_role"] == "admins"
+
+    r = client.post("/api/oidc/auth_url", json={"redirect_uri": "http://x/", "client_nonce": "n1"})
+    assert r.json() == {"auth_url": "https://idp.example/auth?state=s1"}
+    assert seen[-1][2] == {"redirect_uri": "http://x/", "client_nonce": "n1", "role": "admins"}
+
+    r = client.post("/api/oidc/callback", json={"state": "s1", "code": "c1", "client_nonce": "n1"})
+    assert r.json()["token"] == "hvs.new"
+    method, url, _, _ = seen[-1]
+    assert method == "GET" and "/v1/auth/oidc/oidc/callback?" in url and "client_nonce=n1" in url
+
+
+def test_oidc_not_configured(monkeypatch):
+    monkeypatch.delenv("VAULT_OIDC_MOUNT", raising=False)
+    r = client.post("/api/oidc/auth_url", json={"redirect_uri": "http://x/", "client_nonce": "n"})
+    assert r.status_code == 400

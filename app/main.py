@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -52,7 +53,57 @@ async def token(x_vault_token: str | None = Header(default=None),
 def clusters():
     """Configured clusters (names and addresses only; never tokens)."""
     return {"clusters": [{"name": c.name, "addr": c.addr, "namespace": c.namespace,
-                          "monitored": bool(c.monitor_token)} for c in load_clusters()]}
+                          "monitored": bool(c.monitor_token),
+                          "oidc": bool(c.oidc_mount), "oidc_role": c.oidc_role} for c in load_clusters()],
+            "token_login": os.environ.get("VAULT_LOGIN_TOKEN", "on").lower() not in ("0", "off", "false", "no")}
+
+
+class OidcStart(BaseModel):
+    redirect_uri: str
+    client_nonce: str
+    role: str = ""
+
+
+class OidcFinish(BaseModel):
+    state: str
+    code: str
+    client_nonce: str
+
+
+def oidc_mount() -> str:
+    c = cluster_var.get()
+    if not c or not c.oidc_mount:
+        raise HTTPException(400, "OIDC login is not configured for this cluster (set VAULT_OIDC_MOUNT)")
+    return clean_path(c.oidc_mount)
+
+
+async def anon(x_vault_namespace: str | None = Header(default=None), _: None = Depends(select_cluster)) -> None:
+    if x_vault_namespace is not None:
+        namespace_var.set(clean_namespace(x_vault_namespace))
+
+
+@app.post("/api/oidc/auth_url")
+def oidc_auth_url(body: OidcStart, _: None = Depends(anon)):
+    """Step 1: ask Vault's OIDC auth method for the identity provider URL to send the browser to."""
+    payload = {"redirect_uri": body.redirect_uri, "client_nonce": body.client_nonce}
+    role = body.role or cluster_var.get().oidc_role
+    if role:
+        payload["role"] = role
+    data = call("POST", f"auth/{oidc_mount()}/oidc/auth_url", "", payload).get("data", {})
+    if not data.get("auth_url"):
+        raise HTTPException(502, "Vault returned no auth_url")
+    return {"auth_url": data["auth_url"]}
+
+
+@app.post("/api/oidc/callback")
+def oidc_callback(body: OidcFinish, _: None = Depends(anon)):
+    """Step 2: exchange the code and state from the identity provider for a Vault token."""
+    qs = urlencode({"state": body.state, "code": body.code, "client_nonce": body.client_nonce})
+    auth = call("GET", f"auth/{oidc_mount()}/oidc/callback?{qs}", "").get("auth") or {}
+    if not auth.get("client_token"):
+        raise HTTPException(502, "Vault returned no token")
+    return {"token": auth["client_token"], "policies": auth.get("policies", []),
+            "ttl": auth.get("lease_duration", 0), "renewable": auth.get("renewable", False)}
 
 
 @app.get("/api/fleet")

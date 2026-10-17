@@ -81,11 +81,63 @@ async function switchCluster(name) {
 }
 
 // ---------- Login ----------
+async function loadClusters() {
+  const d = await api("/clusters");
+  state.clusters = d.clusters;
+  state.tokenLogin = d.token_login;
+}
+
+function randomNonce() {
+  const a = new Uint8Array(24);
+  crypto.getRandomValues(a);
+  return Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// OIDC: Vault gives the identity provider URL; the provider redirects back here with code and state.
+async function startOidc(role) {
+  const nonce = randomNonce();
+  const redirect = `${location.origin}/`;
+  const { auth_url } = await api("/oidc/auth_url", { method: "POST", body: { redirect_uri: redirect, client_nonce: nonce, role } });
+  sessionStorage.setItem("oidc_pending", JSON.stringify({ cluster: getCluster(), nonce, ns: getNs() }));
+  location.assign(auth_url);
+}
+
+// Returns true when the page was opened by the identity provider redirect.
+async function finishOidc() {
+  const p = new URLSearchParams(location.search);
+  if (!p.get("state") || !(p.get("code") || p.get("error"))) return false;
+  const pending = JSON.parse(sessionStorage.getItem("oidc_pending") || "null");
+  sessionStorage.removeItem("oidc_pending");
+  history.replaceState(null, "", location.pathname);
+  if (!pending) { renderLogin("OIDC sign-in was not started from this browser tab"); return true; }
+  sessionStorage.setItem("vault_cluster", pending.cluster);
+  if (pending.ns) setNs(pending.ns);
+  if (p.get("error")) { renderLogin(`OIDC: ${p.get("error_description") || p.get("error")}`); return true; }
+  try {
+    const r = await api("/oidc/callback", { method: "POST", body: { state: p.get("state"), code: p.get("code"), client_nonce: pending.nonce } });
+    sessionStorage.setItem(key("vault_token"), r.token);
+    await boot();
+  } catch (err) {
+    sessionStorage.removeItem(key("vault_token"));
+    renderLogin(`OIDC sign-in failed: ${err.message}`);
+  }
+  return true;
+}
+
 async function renderLogin(error) {
   let health;
   try { health = await api("/health"); } catch { health = { reachable: false, addr: "?" }; }
+  const cluster = state.clusters.find((c) => c.name === getCluster()) || {};
+  const showToken = state.tokenLogin !== false || !cluster.oidc;
   const input = h("input", { type: "password", placeholder: "Vault token", autofocus: true, required: true });
-  const form = h("form", { onsubmit: async (e) => {
+  const roleInput = h("input", { value: cluster.oidc_role || "", placeholder: "OIDC role (blank = default role)" });
+  const oidcBtn = cluster.oidc && h("div", { class: "oidc" },
+    roleInput,
+    h("button", { class: "btn primary", type: "button", onclick: async (e) => {
+      e.target.disabled = true;
+      try { await startOidc(roleInput.value.trim()); } catch (err) { e.target.disabled = false; renderLogin(err.message); }
+    } }, "Sign in with OIDC"));
+  const form = showToken && h("form", { onsubmit: async (e) => {
     e.preventDefault();
     sessionStorage.setItem(key("vault_token"), input.value);
     try {
@@ -95,14 +147,17 @@ async function renderLogin(error) {
       renderLogin(err.status === 403 || err.status === 401 ? "Invalid or expired token" : err.message);
     }
   } },
-    error && h("div", { class: "error" }, error),
-    clusterPicker(),
     input,
-    h("button", { class: "btn primary", type: "submit" }, "Sign in"),
+    h("button", { class: `btn ${cluster.oidc ? "" : "primary"}`, type: "submit" }, "Sign in with token"),
   );
   $app.replaceChildren(h("div", { class: "login" }, h("div", { class: "box" },
     h("div", { class: "brand" }, h("span", { class: "logo" }, "V"), "Vault Dashboard"),
-    h("div", { class: "card" }, form),
+    h("div", { class: "card" },
+      error && h("div", { class: "error" }, error),
+      clusterPicker(),
+      oidcBtn,
+      oidcBtn && form && h("p", { class: "hint" }, "or"),
+      form),
     h("p", { class: "hint" }, health.reachable
       ? `Connected to ${health.addr}${health.sealed ? " (sealed!)" : ""}`
       : `Cannot reach Vault at ${health.addr}. Set VAULT_ADDR and restart.`),
@@ -644,14 +699,15 @@ async function loadContext() {
 }
 
 async function boot() {
-  if (!state.clusters.length) state.clusters = (await api("/clusters")).clusters;
+  if (!state.clusters.length) await loadClusters();
   state.health = await api("/health");
   await loadContext();
   render();
 }
 
 (async () => {
-  try { state.clusters = (await api("/clusters")).clusters; } catch {}
+  try { await loadClusters(); } catch {}
+  if (await finishOidc()) return;
   if (getToken()) boot().catch(() => renderLogin("Session expired, sign in again"));
   else renderLogin();
 })();

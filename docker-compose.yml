@@ -11,6 +11,9 @@ services:
       # Several clusters + background monitoring: copy clusters.example.json to clusters.json,
       # uncomment the lines below, and pass the monitoring tokens named in it (monitor_token_env).
       # VAULT_CLUSTERS_FILE: /config/clusters.json
+      # VAULT_OIDC_MOUNT: oidc
+      # VAULT_OIDC_ROLE: dashboard
+      # VAULT_LOGIN_TOKEN: "off"
       # VAULT_TOKEN_PROD: ${VAULT_TOKEN_PROD}
       # VAULT_MONITOR_INTERVAL: 300
       # VAULT_ALERT_WEBHOOK: ${VAULT_ALERT_WEBHOOK:-}
