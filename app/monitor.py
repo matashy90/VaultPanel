@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from urllib.parse import urlparse
 
 import httpx
 
@@ -75,15 +76,40 @@ def problems(r: dict) -> dict[str, str]:
     return out
 
 
+def alert_format(url: str) -> str:
+    """'teams' (Adaptive Card) or 'text' (Slack/Mattermost). VAULT_ALERT_FORMAT overrides the URL guess."""
+    fmt = os.environ.get("VAULT_ALERT_FORMAT", "").lower()
+    if fmt in ("teams", "text"):
+        return fmt
+    host = (urlparse(url).hostname or "").lower()
+    teams_hosts = ("logic.azure.com", "powerplatform.com", "webhook.office.com", "office.com")
+    return "teams" if any(host == h or host.endswith("." + h) for h in teams_hosts) else "text"
+
+
+def teams_payload(subject: str, lines: list[str]) -> dict:
+    return {"type": "message", "attachments": [{
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "content": {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard", "version": "1.4",
+            "body": [{"type": "TextBlock", "text": subject, "weight": "Bolder", "size": "Medium", "wrap": True}]
+                    + [{"type": "TextBlock", "text": line, "wrap": True, "spacing": "Small"} for line in lines],
+        }}]}
+
+
 def send_alert(subject: str, lines: list[str]) -> None:
     if len(lines) > 30:
         lines = lines[:30] + [f"... and {len(lines) - 30} more (see the Fleet page)"]
     body = "\n".join(lines)
     url = os.environ.get("VAULT_ALERT_WEBHOOK", "")
     if url.startswith(("http://", "https://")):
+        # The text format is understood by Slack and Mattermost; other receivers can read "lines".
+        payload = (teams_payload(subject, lines) if alert_format(url) == "teams"
+                   else {"text": f"{subject}\n{body}", "lines": lines})
         try:
-            # "text" is understood by Slack and Mattermost; other receivers can read "lines".
-            httpx.post(url, json={"text": f"{subject}\n{body}", "lines": lines}, timeout=10)
+            r = httpx.post(url, json=payload, timeout=10)
+            if r.status_code >= 400:
+                log.warning("Webhook alert rejected: HTTP %s %s", r.status_code, r.text[:200])
         except httpx.HTTPError as e:
             log.warning("Webhook alert failed: %s", e)
     host = os.environ.get("VAULT_ALERT_SMTP_HOST")

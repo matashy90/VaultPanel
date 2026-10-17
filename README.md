@@ -59,10 +59,19 @@ List the clusters in a JSON file and point `VAULT_CLUSTERS_FILE` at it (see [clu
 |---|---|
 | `VAULT_CLUSTERS_FILE` | JSON list of clusters (above). |
 | `VAULT_MONITOR_INTERVAL` | Seconds between background checks (default 300, minimum 30, `0` = off). |
-| `VAULT_ALERT_WEBHOOK` | URL that receives `{"text": ..., "lines": [...]}` (Slack/Mattermost-compatible). |
+| `VAULT_ALERT_WEBHOOK` | Webhook URL. Slack/Mattermost get `{"text": ..., "lines": [...]}`; Microsoft Teams gets an Adaptive Card (see below). |
+| `VAULT_ALERT_FORMAT` | `teams` or `text`. Normally guessed from the URL (`*.logic.azure.com`, `*.powerplatform.com`, `*.office.com` mean Teams). |
 | `VAULT_ALERT_SMTP_HOST`, `_PORT` (587), `_USER`, `_PASSWORD`, `_STARTTLS` (1) | SMTP server for email alerts. |
 | `VAULT_ALERT_EMAIL_FROM`, `VAULT_ALERT_EMAIL_TO` | Sender and comma-separated recipients. |
 | `VAULT_DASH_METRICS_TOKEN` | Optional bearer token for `/metrics`. |
+
+### Microsoft Teams
+Office 365 "Incoming Webhook" connectors are retired; use a Workflow instead:
+1. In Teams open the channel, **… > Workflows**, and pick the template **Post to a channel when a webhook request is received** (a Workflow built in Power Automate with the trigger "When a Teams webhook request is received" works too).
+2. Choose the team and channel, create it, and copy the generated HTTP POST URL.
+3. Set `VAULT_ALERT_WEBHOOK` to that URL. Treat it as a secret: anyone with it can post to the channel.
+
+The URL is recognised as Teams automatically and the alert is posted as an Adaptive Card. The workflow posts as you (or the flow owner), and needs a licence that allows Power Automate workflows in Teams. If your tenant blocks them, ask the Teams admin.
 
 Fleet details are only served to someone holding a valid token on the selected cluster, but `/metrics` is open unless you set the token above. The dashboard itself has no login of its own: anyone who can reach the port can read what the monitoring tokens can see on the Fleet page after signing in with any valid token. Keep it on a trusted network.
 

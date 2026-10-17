@@ -228,3 +228,27 @@ def test_metrics_endpoint(monkeypatch):
     assert client.get("/metrics").status_code == 401
     assert client.get("/metrics", headers={"Authorization": "Bearer s3"}).status_code == 200
     monitor.STATE.clear()
+
+
+def test_teams_webhook_format(monkeypatch):
+    import httpx
+    import monitor
+
+    monkeypatch.delenv("VAULT_ALERT_FORMAT", raising=False)
+    teams = "https://prod-12.westeurope.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?sig=x"
+    assert monitor.alert_format(teams) == "teams"
+    assert monitor.alert_format("https://x.webhook.office.com/webhookb2/abc") == "teams"
+    assert monitor.alert_format("https://hooks.slack.com/services/T/B/x") == "text"
+    assert monitor.alert_format("https://evil.com/?u=logic.azure.com") == "text"
+    monkeypatch.setenv("VAULT_ALERT_FORMAT", "teams")
+    assert monitor.alert_format("https://hooks.slack.com/x") == "teams"
+
+    sent = []
+    monkeypatch.setattr(httpx, "post", lambda url, json, timeout: sent.append(json) or httpx.Response(
+        202, request=httpx.Request("POST", url)))
+    monkeypatch.setenv("VAULT_ALERT_WEBHOOK", teams)
+    monkeypatch.delenv("VAULT_ALERT_FORMAT")
+    monitor.send_alert("Subject", ["line one", "line two"])
+    card = sent[0]["attachments"][0]
+    assert sent[0]["type"] == "message" and card["contentType"] == "application/vnd.microsoft.card.adaptive"
+    assert [b["text"] for b in card["content"]["body"]] == ["Subject", "line one", "line two"]
