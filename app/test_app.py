@@ -69,7 +69,7 @@ def test_readonly_blocks_writes(monkeypatch):
 def test_write_requires_token():
     r = client.post("/api/kv/write", json={"mount": "secret", "path": "x", "data": {"a": "b"}})
     assert r.status_code == 401
-    assert client.get("/api/audit").status_code == 401
+    assert client.get("/api/scan/audit").status_code == 401
     assert client.get("/api/kv/search?mount=secret&q=a").status_code == 401
 
 
@@ -97,7 +97,9 @@ def test_expiry_status_and_cert_info():
 
 
 def test_expiry_requires_token():
-    assert client.get("/api/expiry").status_code == 401
+    assert client.get("/api/scan/expiry").status_code == 401
+    assert client.post("/api/scan/expiry").status_code == 401
+    assert client.get("/api/scan/nope", headers={"X-Vault-Token": "t"}).status_code == 404
 
 
 def test_namespace_validation():
@@ -120,7 +122,7 @@ def test_namespace_header_and_ca_are_sent(monkeypatch):
         seen.append((url, kw["headers"], kw["verify"]))
         return httpx.Response(200, json={"data": {"policies": ["default"]}}, request=httpx.Request(method, url))
 
-    monkeypatch.setattr(httpx, "request", fake)
+    monkeypatch.setattr(vault, "_http", fake)
     monkeypatch.setenv("VAULT_CACERT", "/etc/ca.pem")
     h = {"X-Vault-Token": "t", "X-Vault-Namespace": "/admin/team-a/"}
     assert client.get("/api/me", headers=h).status_code == 200
@@ -148,6 +150,8 @@ def test_clusters_file_and_per_cluster_routing(monkeypatch, tmp_path):
     import httpx
 
     monkeypatch.setenv("TOK_B", "svc-b")
+    import vault
+
     write_clusters(tmp_path, monkeypatch, [
         {"name": "a", "addr": "https://a.example:8200/"},
         {"name": "b", "addr": "https://b.example:8200", "cacert": "/ca-b.pem", "namespace": "admin",
@@ -162,7 +166,7 @@ def test_clusters_file_and_per_cluster_routing(monkeypatch, tmp_path):
         seen.append((url, kw["headers"], kw["verify"]))
         return httpx.Response(200, json={"data": {}}, request=httpx.Request(method, url))
 
-    monkeypatch.setattr(httpx, "request", fake)
+    monkeypatch.setattr(vault, "_http", fake)
     client.get("/api/me", headers={"X-Vault-Token": "t", "X-Vault-Cluster": "b"})
     url, headers, verify = seen[-1]
     assert url.startswith("https://b.example:8200/") and verify == "/ca-b.pem"
@@ -252,3 +256,155 @@ def test_teams_webhook_format(monkeypatch):
     card = sent[0]["attachments"][0]
     assert sent[0]["type"] == "message" and card["contentType"] == "application/vnd.microsoft.card.adaptive"
     assert [b["text"] for b in card["content"]["body"]] == ["Subject", "line one", "line two"]
+
+
+def test_throttle_spaces_requests():
+    import time
+    from vault import Throttle
+
+    th = Throttle(50)                        # one request per 20 ms
+    start = time.monotonic()
+    for _ in range(6):
+        th.wait()
+    assert time.monotonic() - start >= 0.09
+    assert Throttle(0).interval == 0
+    th.slow_down()
+    assert th.interval >= 0.1
+
+
+def test_call_retries_429_only_during_scans(monkeypatch):
+    import httpx
+    import vault
+
+    calls = []
+
+    def fake(method, url, **kw):
+        calls.append(1)
+        status = 429 if len(calls) < 3 else 200
+        return httpx.Response(status, json={"errors": ["rate limited"], "data": {}}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(vault, "_http", fake)
+    monkeypatch.setattr(vault.time, "sleep", lambda s: None)
+    with pytest.raises(HTTPException) as e:          # interactive request: no retry
+        vault.call("GET", "x", "t")
+    assert e.value.status_code == 429 and len(calls) == 1
+    calls.clear()
+    tok = vault.throttle_var.set(vault.Throttle(0))
+    try:
+        assert vault.call("GET", "x", "t") == {"errors": ["rate limited"], "data": {}}
+    finally:
+        vault.throttle_var.reset(tok)
+    assert len(calls) == 3
+
+
+def test_limits_from_env(monkeypatch):
+    import scan
+
+    monkeypatch.setenv("VAULT_SCAN_RPS", "5")
+    monkeypatch.setenv("VAULT_SCAN_MAX_TOKENS", "10")
+    monkeypatch.setenv("VAULT_SCAN_CONCURRENCY", "bogus")
+    lim = scan.Limits.from_env()
+    assert lim.rps == 5 and lim.tokens == 10 and lim.concurrency == scan.Limits.concurrency
+
+
+def test_scan_map_respects_budget_and_skips_errors():
+    import scan
+
+    s = scan.Scan(scan.Limits(rps=0, concurrency=2, budget=10))
+
+    def fn(i):
+        if i == 1:
+            raise HTTPException(403, "nope")
+        return i
+
+    assert sorted(s.map(fn, list(range(10)), "x")) == [0, 2, 3, 4, 5, 6, 7, 8, 9]
+    s2 = scan.Scan(scan.Limits(rps=0, concurrency=2, budget=10))
+    s2.deadline = 0                                   # budget already used up
+    assert s2.map(fn, list(range(10)), "things") == []
+    assert "Time budget" in s2.notes[0]
+
+
+def test_namespace_walk_is_capped(monkeypatch):
+    import scan
+    import vault
+
+    tree = {"": ["a/", "b/"], "a": ["a1/", "a2/"], "b": [], "a/a1": [], "a/a2": []}
+    monkeypatch.setattr(scan, "list_keys", lambda path, t: tree[vault.namespace_var.get()])
+    s = scan.Scan(scan.Limits(namespaces=10))
+    assert s.namespaces("t") == ["", "a", "b", "a/a1", "a/a2"]
+    s = scan.Scan(scan.Limits(namespaces=3))
+    assert s.namespaces("t") == ["", "a", "b"] and "first 3 namespaces" in s.notes[0]
+
+
+def fake_vault(monkeypatch, namespaces_tree):
+    """Fake Vault with a token and a secret ID expiring soon in every namespace; records namespaces seen."""
+    import scan
+    import vault
+    from datetime import datetime, timedelta, timezone
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+    far = (datetime.now(timezone.utc) + timedelta(days=400)).isoformat()
+    seen = []
+
+    def list_keys(path, t):
+        ns = vault.namespace_var.get()
+        seen.append((ns, path))
+        if path == "sys/namespaces":
+            return namespaces_tree.get(ns, [])
+        if path == "auth/token/accessors":
+            return ["acc1", "acc2"]
+        if path == "auth/approle/role":
+            return ["r1"]
+        if path.endswith("/secret-id"):
+            return ["sid1"]
+        return []
+
+    def call(method, path, t, json=None):
+        if path == "auth/token/lookup-accessor":
+            exp = soon if json["accessor"] == "acc1" else far
+            return {"data": {"display_name": json["accessor"], "policies": ["p"], "expire_time": exp}}
+        if path == "sys/internal/ui/mounts":
+            return {"data": {"secret": {}, "auth": {"approle/": {"type": "approle"}}}}
+        if path.endswith("secret-id-accessor/lookup"):
+            return {"data": {"expiration_time": soon}}
+        raise HTTPException(404, "x")
+
+    monkeypatch.setattr(scan, "list_keys", list_keys)
+    monkeypatch.setattr(scan, "call", call)
+    return seen
+
+
+def test_scan_expiry_walks_namespaces(monkeypatch):
+    import scan
+
+    fake_vault(monkeypatch, {"": ["team/"]})
+    res = scan.scan_expiry("t", 30, scan.Scan(scan.Limits(rps=0, concurrency=2)))
+    assert res["namespaces"] == 2
+    assert res["counts"] == {"expired": 0, "critical": 4, "warning": 0, "ok": 2}   # 2 tokens + 2 approle ids; far ones are "later"
+    assert res["later"] == 2 and len(res["items"]) == 4
+    assert any(i["source"].startswith("[team] ") for i in res["items"])
+    assert res["by_kind"]["token"]["critical"] == 2
+
+
+def test_scan_job_is_private_to_the_token(monkeypatch):
+    import time
+    import scan
+    import vault
+
+    fake_vault(monkeypatch, {})
+    monkeypatch.setattr(scan, "call", lambda *a, **k: (
+        {"data": {}} if a[1] == "auth/token/lookup-self" else
+        {"data": {"display_name": "x", "policies": [], "expire_time": None}} if a[1] == "auth/token/lookup-accessor"
+        else {"data": {"secret": {}, "auth": {}}}))
+    scan.JOBS.clear()
+    started = scan.start_job("expiry", "token-a", 30)
+    assert started["state"] in ("running", "done")
+    for _ in range(50):
+        job = scan.get_job("expiry", "token-a")
+        if job["state"] != "running":
+            break
+        time.sleep(0.05)
+    assert job["state"] == "done" and job["result"]["counts"]["ok"] == 0
+    assert "token-a" not in repr(scan.JOBS.keys())      # only a hash is used as the key
+    assert scan.get_job("expiry", "token-b") == {"state": "none"}
+    scan.JOBS.clear()

@@ -75,6 +75,23 @@ The URL is recognised as Teams automatically and the alert is posted as an Adapt
 
 Fleet details are only served to someone holding a valid token on the selected cluster, but `/metrics` is open unless you set the token above. The dashboard itself has no login of its own: anyone who can reach the port can read what the monitoring tokens can see on the Fleet page after signing in with any valid token. Keep it on a trusted network.
 
+## Large clusters (audit and expiry scans)
+
+Audit and Expiry run as background jobs with a rate limit, so they cannot flood Vault. They walk every namespace (breadth-first), show progress, can be cancelled, and return partial results with a note if a limit or the time budget is hit. Results are cached per token; changing the warn window does not rescan.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `VAULT_SCAN_RPS` | 20 | Max Vault requests per second per scan (slows down on HTTP 429) |
+| `VAULT_SCAN_CONCURRENCY` | 4 | Parallel requests |
+| `VAULT_SCAN_BUDGET` | 900 | Max seconds per scan (min 10) |
+| `VAULT_SCAN_MAX_NAMESPACES` | 50 | Namespaces walked |
+| `VAULT_SCAN_MAX_TOKENS` | 5000 | Token accessors per namespace |
+| `VAULT_SCAN_MAX_SECRETS` | 5000 | Secrets per KV v2 mount |
+| `VAULT_SCAN_MAX_CERTS` | 1000 | Certificates per PKI mount |
+| `VAULT_SCAN_MAX_ROLES` / `VAULT_SCAN_MAX_SECRET_IDS` | 500 / 100 | AppRole roles / secret IDs per role |
+
+Advice: start with `VAULT_SCAN_RPS=10`, raise it while watching Vault's own metrics, and set `VAULT_MONITOR_INTERVAL=3600` or more for the background monitor. Measured on a local dev Vault at 40 req/s: 408 tokens + 502 secrets in about 24 s.
+
 ## Security notes
 - Serve it over HTTPS (reverse proxy) if it is reachable beyond localhost; tokens travel in a request header.
 - Writes are only possible with what the token's own policies allow. Set `VAULT_DASH_READONLY=1` for view-only deployments.

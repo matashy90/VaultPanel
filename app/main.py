@@ -2,7 +2,6 @@ import hmac
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,14 +12,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import monitor
+import scan
 from clusters import cluster_var, get_cluster, load_clusters
-from vault import (call, cert_info, clean_namespace, clean_path, expiry_status, list_keys,
-                   namespace_var, parse_policy, parse_time, readonly, tls_verify, vault_addr, walk_kv)
+from vault import (_http, call, clean_namespace, clean_path, list_keys, namespace_var, parse_policy,
+                   readonly, tls_verify, vault_addr, walk_kv)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    stop = monitor.start(scan_expiry)
+    stop = monitor.start(scan.monitor_expiry)
     yield
     if stop:
         stop.set()
@@ -65,10 +65,10 @@ def fleet(t: str = Depends(token)):
     out = []
     for c, h in zip(clusters_cfg, health):
         cached = monitor.STATE.get(c.name, {})
-        scan = {k: cached[k] for k in ("counts", "notes", "items", "by_kind", "scan_error", "checked_at")
-                if k in cached}
+        scan_data = {k: cached[k] for k in ("counts", "notes", "items", "by_kind", "scan_error", "checked_at",
+                                            "namespaces") if k in cached}
         out.append({"name": c.name, "addr": c.addr, "namespace": c.namespace,
-                    "monitored": bool(c.monitor_token), **scan, **h})
+                    "monitored": bool(c.monitor_token), **scan_data, **h})
     return {"clusters": out, "alerts_enabled": monitor.alerts_enabled(), "interval": monitor.interval()}
 
 
@@ -79,7 +79,6 @@ def metrics(request: Request):
     if expected and not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {expected}"):
         raise HTTPException(401, "Invalid metrics token")
     return monitor.metrics_text()
-
 
 
 @app.get("/api/namespaces")
@@ -97,7 +96,7 @@ def namespaces(t: str = Depends(token)):
 def health(_: None = Depends(select_cluster)):
     url = f"{vault_addr()}/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200"
     try:
-        data = httpx.get(url, timeout=5, verify=tls_verify()).json()
+        data = _http("GET", url, timeout=5, verify=tls_verify()).json()
     except (httpx.HTTPError, ValueError) as e:
         return {"addr": vault_addr(), "reachable": False, "error": str(e), "readonly": readonly()}
     return {"addr": vault_addr(), "reachable": True, "readonly": readonly(), **data}
@@ -230,179 +229,39 @@ def kv_search(mount: str, q: str, t: str = Depends(token)):
             "truncated": truncated}
 
 
-def finding(severity: str, category: str, title: str, detail: str) -> dict:
-    return {"severity": severity, "category": category, "title": title, "detail": detail}
+# Audit and expiry run as background jobs, because on a large Vault they take minutes.
+SCAN_PARAMS = {"audit": ("stale_days", 90), "expiry": ("warn_days", 30)}
 
 
-@app.get("/api/audit")
-def audit(stale_days: int = 90, t: str = Depends(token)):
-    findings: list[dict] = []
-    notes: list[str] = []
-    stats = {"policies": 0, "tokens": 0, "secrets": 0}
-    now = datetime.now(timezone.utc)
-
-    me_data = call("GET", "auth/token/lookup-self", t)["data"]
-    if "root" in (me_data.get("policies") or []):
-        findings.append(finding("high", "Tokens", "Dashboard is signed in with a root token",
-                                "Root tokens bypass all policies. Use a scoped token for daily use."))
-
-    try:
-        names = [n for n in list_keys("sys/policies/acl", t) if n != "root"]
-    except HTTPException as e:
-        names = []
-        notes.append(f"Policies not audited: {e.detail}")
-    for name in names:
-        stats["policies"] += 1
-        data = call("GET", f"sys/policies/acl/{clean_path(name)}", t)["data"]
-        for rule in parse_policy(data["policy"]):
-            if not rule["risky"]:
-                continue
-            severe = "sudo" in rule["capabilities"] or rule["path"] in ("*", "/*")
-            findings.append(finding(
-                "high" if severe else "medium", "Policies", f"Broad rule in policy '{name}'",
-                f'path "{rule["path"]}" grants {", ".join(rule["capabilities"]) or "no capabilities"}'))
-
-    try:
-        accessors = list_keys("auth/token/accessors", t)
-        for acc in accessors[:200]:
-            info = call("POST", "auth/token/lookup-accessor", t, {"accessor": acc})["data"]
-            stats["tokens"] += 1
-            label = info.get("display_name") or acc
-            pols = info.get("policies") or []
-            if "root" in pols:
-                findings.append(finding("high", "Tokens", f"Active root token ({label})",
-                                        f"Accessor {acc}. Revoke it once no longer needed."))
-            elif not info.get("ttl") and not info.get("expire_time"):
-                findings.append(finding("medium", "Tokens", f"Token without expiry ({label})",
-                                        f"Accessor {acc}, policies: {', '.join(pols) or 'none'}."))
-        if len(accessors) > 200:
-            notes.append("Only the first 200 tokens were checked.")
-    except HTTPException as e:
-        notes.append(f"Tokens not audited: {e.detail}")
-
-    mounts = call("GET", "sys/internal/ui/mounts", t)["data"].get("secret", {})
-    for mount, info in mounts.items():
-        if info.get("type") not in ("kv", "generic"):
-            continue
-        v2 = str((info.get("options") or {}).get("version") or "1") == "2"
-        if not v2:
-            continue  # KV v1 keeps no timestamps
-        mname = mount.strip("/")
-        try:
-            paths, truncated = walk_kv(mname, True, t, limit=300)
-        except HTTPException as e:
-            notes.append(f"Secrets in '{mount}' not audited: {e.detail}")
-            continue
-        if truncated:
-            notes.append(f"Only the first 300 secrets in '{mount}' were checked.")
-        for p in paths:
-            try:
-                meta = call("GET", f"{mname}/metadata/{clean_path(p)}", t)["data"]
-            except HTTPException:
-                continue
-            stats["secrets"] += 1
-            updated = parse_time(meta.get("updated_time"))
-            if updated and (now - updated).days >= stale_days:
-                findings.append(finding(
-                    "low", "Secrets", f"Stale secret {mname}/{p}",
-                    f"Last changed {(now - updated).days} days ago (threshold {stale_days})."))
-
-    order = {"high": 0, "medium": 1, "low": 2}
-    findings.sort(key=lambda f: (order[f["severity"]], f["category"], f["title"]))
-    return {"findings": findings, "notes": notes, "stats": stats, "stale_days": stale_days}
+def scan_kind(kind: str) -> str:
+    if kind not in SCAN_PARAMS:
+        raise HTTPException(404, "Unknown scan")
+    return kind
 
 
-@app.get("/api/expiry")
-def expiry(warn_days: int = 30, t: str = Depends(token)):
-    """Expiry of tokens, PKI certificates and AppRole secret IDs."""
-    return scan_expiry(t, warn_days)
+@app.get("/api/scan/{kind}")
+def scan_status(kind: str, t: str = Depends(token)):
+    """State, progress and (when done) result of the caller's latest scan on this cluster/namespace."""
+    return scan.get_job(scan_kind(kind), t)
 
 
-def scan_expiry(t: str, warn_days: int = 30) -> dict:
-    now = datetime.now(timezone.utc)
-    items: list[dict] = []
-    notes: list[str] = []
+@app.post("/api/scan/{kind}")
+def scan_start(kind: str, stale_days: int = 90, warn_days: int = 30, t: str = Depends(token)):
+    scan_kind(kind)
+    value = max(1, min(stale_days if kind == "audit" else warn_days, 3650))
+    return scan.start_job(kind, t, value)
 
-    def add(kind: str, name: str, source: str, expires: datetime | None) -> None:
-        if expires is None:
-            return
-        days = (expires - now).days if expires > now else -((now - expires).days + 1)
-        items.append({"kind": kind, "name": name, "source": source,
-                      "expires": expires.isoformat(), "days_left": days,
-                      "status": expiry_status(days, warn_days)})
 
-    try:
-        accessors = list_keys("auth/token/accessors", t)
-        for acc in accessors[:200]:
-            try:
-                info = call("POST", "auth/token/lookup-accessor", t, {"accessor": acc})["data"]
-            except HTTPException:
-                continue
-            add("token", info.get("display_name") or "token",
-                f"accessor {acc} · {', '.join(info.get('policies') or [])}",
-                parse_time(info.get("expire_time")))
-        if len(accessors) > 200:
-            notes.append("Only the first 200 tokens were checked.")
-    except HTTPException as e:
-        notes.append(f"Tokens not checked: {e.detail}")
+@app.post("/api/scan/{kind}/cancel")
+def scan_cancel(kind: str, t: str = Depends(token)):
+    return scan.cancel_job(scan_kind(kind), t)
 
-    ui = call("GET", "sys/internal/ui/mounts", t)["data"]
-    for mount, info in ui.get("secret", {}).items():
-        if info.get("type") != "pki":
-            continue
-        mname = mount.strip("/")
-        seen: set[tuple[str, datetime]] = set()
-        try:
-            serials = list_keys(f"{mname}/certs", t)
-            if len(serials) > 200:
-                notes.append(f"Only the first 200 certificates in '{mount}' were checked.")
-            for serial in serials[:200]:
-                data = call("GET", f"{mname}/cert/{clean_path(serial)}", t)["data"]
-                if data.get("revocation_time"):
-                    continue
-                cn, exp = cert_info(data["certificate"])
-                seen.add((cn, exp))
-                add("certificate", cn, f"{mname} · serial {serial}", exp)
-            ca = call("GET", f"{mname}/cert/ca", t).get("data", {}).get("certificate")
-            if ca:
-                cn, exp = cert_info(ca)
-                if (cn, exp) not in seen:
-                    add("certificate", f"{cn} (CA)", f"{mname} · issuing CA", exp)
-        except HTTPException as e:
-            notes.append(f"Certificates in '{mount}' not checked: {e.detail}")
-        except Exception as e:
-            notes.append(f"Certificates in '{mount}' could not be parsed: {e}")
 
-    for mount, info in ui.get("auth", {}).items():
-        if info.get("type") != "approle":
-            continue
-        mname = mount.strip("/")
-        try:
-            roles = list_keys(f"auth/{mname}/role", t)
-            if len(roles) > 100:
-                notes.append(f"Only the first 100 AppRoles in '{mount}' were checked.")
-            for role in roles[:100]:
-                r = clean_path(role)
-                accs = list_keys(f"auth/{mname}/role/{r}/secret-id", t)
-                never = 0
-                for acc in accs[:100]:
-                    try:
-                        sid = call("POST", f"auth/{mname}/role/{r}/secret-id-accessor/lookup", t,
-                                   {"secret_id_accessor": acc})["data"]
-                    except HTTPException:
-                        continue
-                    exp = parse_time(sid.get("expiration_time"))
-                    if exp is None:
-                        never += 1
-                    add("approle", f"{role} secret ID", f"{mname} · accessor {acc}", exp)
-                if never:
-                    notes.append(f"AppRole '{role}' has {never} secret ID(s) that never expire.")
-        except HTTPException as e:
-            notes.append(f"AppRoles in '{mount}' not checked: {e.detail}")
+@app.get("/api/scan-limits")
+def scan_limits(_: str = Depends(token)):
+    from dataclasses import asdict
 
-    items.sort(key=lambda i: i["expires"])
-    counts = {s: sum(1 for i in items if i["status"] == s) for s in ("expired", "critical", "warning", "ok")}
-    return {"items": items, "counts": counts, "notes": notes, "warn_days": warn_days}
+    return asdict(scan.Limits.from_env())
 
 
 app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")

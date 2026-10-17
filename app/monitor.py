@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import httpx
 
 from clusters import Cluster, load_clusters, use_cluster
-from vault import parse_time, tls_verify, vault_addr
+from vault import _http, parse_time, tls_verify, vault_addr
 
 log = logging.getLogger("onepane.monitor")
 
@@ -29,7 +29,7 @@ def cluster_health(cluster: Cluster) -> dict:
     with use_cluster(cluster):
         url = f"{vault_addr()}/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200"
         try:
-            d = httpx.get(url, timeout=5, verify=tls_verify()).json()
+            d = _http("GET", url, timeout=5, verify=tls_verify()).json()
         except (httpx.HTTPError, ValueError) as e:
             return {"up": False, "error": str(e)}
     return {"up": True, "sealed": bool(d.get("sealed")), "standby": bool(d.get("standby")),
@@ -47,9 +47,9 @@ def scan_cluster(cluster: Cluster, scan_fn, warn_days: int) -> dict:
                 scan = scan_fn(cluster.monitor_token, warn_days)
             result["counts"] = scan["counts"]
             result["notes"] = scan["notes"]
-            result["items"] = [i for i in scan["items"] if i["status"] != "ok"][:100]
-            result["by_kind"] = {k: {s: sum(1 for i in scan["items"] if i["kind"] == k and i["status"] == s)
-                                     for s in STATUSES} for k in KINDS}
+            result["items"] = [i for i in scan["items"] if i["status"] != "ok"][:1000]
+            result["by_kind"] = scan["by_kind"]
+            result["namespaces"] = scan.get("namespaces", 1)
         except Exception as e:  # a broken scan must not kill the monitor loop
             result["scan_error"] = str(getattr(e, "detail", e))
     return result

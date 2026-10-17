@@ -1,5 +1,7 @@
 import os
 import re
+import threading
+import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -12,6 +14,34 @@ from clusters import cluster_var
 # Set per request by the auth dependency; read by call() for every Vault request.
 namespace_var: ContextVar[str] = ContextVar("vault_namespace", default="")
 NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_\-./]*$")
+
+
+class Throttle:
+    """Caps the request rate towards one Vault (shared by all worker threads of a scan)."""
+
+    def __init__(self, rps: float):
+        self.interval = 1.0 / rps if rps > 0 else 0.0
+        self._next = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self) -> None:
+        if not self.interval:
+            return
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next)
+            self._next = slot + self.interval
+        if slot > now:
+            time.sleep(slot - now)
+
+    def slow_down(self) -> None:
+        """Called when Vault answers 429: halve the rate (down to one request per two seconds)."""
+        with self._lock:
+            self.interval = min(max(self.interval * 2, 0.1), 2.0)
+
+
+# Set by a scan; makes call() throttled and patient with 429 responses.
+throttle_var: ContextVar[Throttle | None] = ContextVar("vault_throttle", default=None)
 
 
 def vault_addr() -> str:
@@ -44,15 +74,40 @@ def clean_path(path: str) -> str:
     return "/".join(quote(s, safe="") for s in segments)
 
 
+# Shared clients (one per CA setting): building an SSL context per request costs seconds on some
+# machines, and reusing connections avoids a TLS handshake per call.
+_clients: dict = {}
+_clients_lock = threading.Lock()
+
+
+def _http(method: str, url: str, **kw) -> httpx.Response:
+    verify = kw.pop("verify", True)
+    with _clients_lock:
+        client = _clients.get(verify)
+        if client is None:
+            client = _clients[verify] = httpx.Client(verify=verify)
+    return client.request(method, url, **kw)
+
+
 def call(method: str, path: str, token: str, json: dict | None = None) -> dict:
     url = f"{vault_addr()}/v1/{path}"
     headers = {"X-Vault-Token": token}
     if namespace_var.get():
         headers["X-Vault-Namespace"] = namespace_var.get()
-    try:
-        r = httpx.request(method, url, headers=headers, json=json, timeout=10, verify=tls_verify())
-    except httpx.HTTPError as e:
-        raise HTTPException(502, f"Cannot reach Vault at {vault_addr()}: {e}")
+    throttle = throttle_var.get()
+    for attempt in range(4):
+        if throttle:
+            throttle.wait()
+        try:
+            r = _http(method, url, headers=headers, json=json, timeout=10, verify=tls_verify())
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"Cannot reach Vault at {vault_addr()}: {e}")
+        # Rate-limit responses are retried with backoff, but only during scans.
+        if r.status_code == 429 and throttle and attempt < 3:
+            throttle.slow_down()
+            time.sleep(2 ** attempt)
+            continue
+        break
     if r.status_code >= 400:
         try:
             errors = r.json().get("errors") or []
@@ -87,13 +142,20 @@ def parse_time(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def walk_kv(mount: str, v2: bool, token: str, limit: int = 500, max_depth: int = 10):
-    """Returns (secret paths, truncated) by walking a KV mount's key tree."""
+def walk_kv(mount: str, v2: bool, token: str, limit: int = 500, max_depth: int = 10,
+            max_lists: int = 2000, stop=None):
+    """Returns (secret paths, truncated) by walking a KV mount's key tree.
+
+    Stops at `limit` secrets, `max_lists` LIST calls, or when stop() returns true."""
     base = f"{mount}/metadata" if v2 else mount
     found: list[str] = []
     stack = [("", 0)]
+    lists = 0
     while stack:
+        if lists >= max_lists or (stop and stop()):
+            return sorted(found), True
         prefix, depth = stack.pop()
+        lists += 1
         try:
             keys = list_keys(f"{base}/{clean_path(prefix)}".rstrip("/") + "/", token)
         except HTTPException as e:

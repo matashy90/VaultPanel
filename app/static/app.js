@@ -176,6 +176,61 @@ async function render() {
   }
 }
 
+// ---------- Background scans ----------
+const ago = (ts) => {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  return s < 90 ? "just now" : s < 5400 ? `${Math.round(s / 60)} min ago` : `${Math.round(s / 3600)} h ago`;
+};
+const classify = (days, warn) => (days < 0 ? "expired" : days <= 7 ? "critical" : days <= warn ? "warning" : "ok");
+const countStatus = (items, later = 0) => {
+  const c = { expired: 0, critical: 0, warning: 0, ok: later };
+  items.forEach((i) => c[i.status]++);
+  return c;
+};
+
+function progressCard(kind, job) {
+  const text = (j) => {
+    const p = j.progress || {};
+    const of = p.total ? ` ${p.done} / ${p.total}` : "";
+    return `Scanning… ${p.phase || ""}${of} · ${Math.round(Date.now() / 1000 - j.started)}s`;
+  };
+  const label = h("span", {}, text(job));
+  const box = h("div", { class: "card row between" }, label,
+    h("button", { class: "btn", onclick: async () => { await api(`/scan/${kind}/cancel`, { method: "POST" }).catch(() => {}); } }, "Cancel"));
+  const tick = async () => {
+    if (!box.isConnected) return; // the user left this page
+    try {
+      const j = await api(`/scan/${kind}`);
+      if (j.state === "running") { label.textContent = text(j); setTimeout(tick, 2000); } else render();
+    } catch (e) { box.replaceChildren(errorBox(e)); }
+  };
+  setTimeout(tick, 1500);
+  return box;
+}
+
+// Shows the caller's latest background scan, starting one if none exists. A scan of a large Vault takes minutes
+// and is throttled, so the page polls for progress instead of waiting on one request.
+async function scanPage(kind, title, opts, body) {
+  const key = kind === "audit" ? "stale_days" : "warn_days";
+  const start = (value) => api(`/scan/${kind}?${q({ [key]: value })}`, { method: "POST" });
+  let job = await api(`/scan/${kind}`);
+  if (job.state === "none" || (opts.restartOnChange && opts.want && job.state !== "running" && job.param !== opts.want)) {
+    job = await start(opts.want || opts.dflt);
+  }
+  const head = h("div", { class: "row between" }, h("h2", {}, title));
+  if (job.state === "running") return h("div", {}, head, progressCard(kind, job));
+  const rescan = h("button", { class: "btn", onclick: async () => {
+    try { await start(opts.want || job.param || opts.dflt); } catch (e) { alert(e.message); }
+    render();
+  } }, "Rescan");
+  if (job.state === "error") return h("div", {}, head, h("div", { class: "error" }, job.error), rescan);
+  const l = job.limits || {};
+  const meta = h("div", { class: "card row between", style: "color:var(--muted)" },
+    h("span", {}, `Scanned ${ago(job.finished)} in ${Math.round(job.finished - job.started)}s · limits: ` +
+      `${l.rps || "no"} req/s, ${l.concurrency} parallel, ${l.budget}s budget`), rescan);
+  return body(job.result, job, meta, head);
+}
+
 // ---------- Views ----------
 const views = {
   async overview() {
@@ -183,7 +238,7 @@ const views = {
     const ttl = me.ttl;
     const policies = me.policies || [];
     let expiring = null;
-    try { expiring = (await api("/expiry")).counts; } catch {}
+    try { const j = await api("/scan/expiry"); if (j.state === "done") expiring = j.result.counts; } catch {}
     const attention = expiring ? expiring.expired + expiring.critical + expiring.warning : null;
     return h("div", {},
       h("h2", {}, "Overview"),
@@ -193,10 +248,10 @@ const views = {
         stat("Cluster", health.cluster_name || "-"),
         stat("Secret engines", Object.keys(mounts.secret).length),
         stat("Auth methods", Object.keys(mounts.auth).length),
-        attention !== null && h("div", { class: "stat", style: "cursor:pointer", onclick: () => go("expiry") },
-          h("small", {}, "Expiring ≤30d / expired"),
-          h("strong", { class: `badge ${expiring.expired + expiring.critical ? "bad" : attention ? "warn" : "ok"}`,
-            style: "font-size:16px" }, attention))),
+      h("div", { class: "stat", style: "cursor:pointer", onclick: () => go("expiry") },
+        h("small", {}, "Expiring ≤30d / expired"),
+        h("strong", { class: `badge ${attention === null ? "" : expiring.expired + expiring.critical ? "bad" : attention ? "warn" : "ok"}`,
+          style: "font-size:16px" }, attention === null ? "open Expiry to scan" : attention))),
       h("div", { class: "card" },
         h("h3", {}, "Your token"),
         h("table", {}, h("tbody", {},
@@ -300,7 +355,9 @@ const views = {
   async expiry() {
     const days = state.warnDays || 30;
     const kind = state.expiryKind || "all";
-    const r = await api(`/expiry?${q({ warn_days: days })}`);
+    return scanPage("expiry", "Expiry", { dflt: 30 }, (res, job, meta) => {
+    const items = res.items.map((i) => ({ ...i, status: classify(i.days_left, days) }));
+    const r = { items, notes: res.notes, counts: countStatus(items, res.later) };
     const tone = { expired: "bad", critical: "bad", warning: "warn", ok: "ok" };
     const KIND = { token: "Token", certificate: "Certificate", approle: "AppRole" };
     const shown = r.items.filter((i) => kind === "all" || i.kind === kind);
@@ -315,6 +372,7 @@ const views = {
     return h("div", {},
       h("div", { class: "row between" }, h("h2", {}, "Expiry"),
         h("label", { class: "row", style: "color:var(--muted)" }, "Warn within", select)),
+      meta,
       h("div", { class: "grid" },
         stat("Expired", r.counts.expired, r.counts.expired ? "bad" : "ok"),
         stat("Critical (≤7d)", r.counts.critical, r.counts.critical ? "bad" : "ok"),
@@ -329,12 +387,14 @@ const views = {
           }, k === "all" ? "All" : KIND[k]))),
         shown.length ? h("table", {},
           h("thead", {}, h("tr", {}, ["Status", "Type", "Name", "Source", "Expires"].map((c) => h("th", {}, c)))),
-          h("tbody", {}, shown.map((i) => h("tr", {},
+          h("tbody", {}, shown.slice(0, 500).map((i) => h("tr", {},
             h("td", {}, h("span", { class: `badge ${tone[i.status]}` }, i.status)),
             h("td", {}, KIND[i.kind]), h("td", {}, h("strong", {}, i.name)),
             h("td", { style: "color:var(--muted)" }, i.source),
             h("td", {}, `${fmtDate(i.expires)} (${when(i)})`)))))
-          : h("p", { class: "empty" }, "Nothing with an expiry date found.")));
+          : h("p", { class: "empty" }, "Nothing with an expiry date found."),
+        shown.length > 500 && h("p", { class: "hint" }, `Showing the first 500 of ${shown.length}, sorted by expiry.`)));
+    });
   },
 
   async fleet() {
@@ -387,8 +447,8 @@ const views = {
   },
 
   async audit() {
-    const days = state.staleDays || 90;
-    const r = await api(`/audit?${q({ stale_days: days })}`);
+    return scanPage("audit", "Audit", { dflt: 90, want: state.staleDays, restartOnChange: true }, (r, job, meta) => {
+    const days = state.staleDays || job.param || 90;
     const counts = { high: 0, medium: 0, low: 0 };
     r.findings.forEach((f) => counts[f.severity]++);
     const tone = { high: "bad", medium: "warn", low: "" };
@@ -396,12 +456,13 @@ const views = {
       [30, 90, 180, 365].map((d) => h("option", { value: d, selected: d === days }, `${d} days`)));
     return h("div", {},
       h("div", { class: "row between" }, h("h2", {}, "Audit"),
-        h("label", { class: "row", style: "color:var(--muted)" }, "Stale after", select)),
+        h("label", { class: "row", style: "color:var(--muted)" }, "Stale after (rescans)", select)),
+      meta,
       h("div", { class: "grid" },
         stat("High", counts.high, counts.high ? "bad" : "ok"),
         stat("Medium", counts.medium, counts.medium ? "warn" : "ok"),
         stat("Low", counts.low),
-        stat("Checked", `${r.stats.policies} policies · ${r.stats.tokens} tokens · ${r.stats.secrets} secrets`)),
+        stat("Checked", `${r.stats.namespaces || 1} ns · ${r.stats.policies} policies · ${r.stats.tokens} tokens · ${r.stats.secrets} secrets`)),
       r.notes.map((n) => h("div", { class: "card", style: "color:var(--muted)" }, "ℹ ", n)),
       h("div", { class: "card" }, r.findings.length ? h("table", {},
         h("thead", {}, h("tr", {}, ["Severity", "Area", "Finding", "Details"].map((c) => h("th", {}, c)))),
@@ -410,6 +471,7 @@ const views = {
           h("td", {}, f.category), h("td", {}, h("strong", {}, f.title)),
           h("td", { style: "color:var(--muted)" }, f.detail)))))
         : h("p", { class: "empty" }, "No issues found. 🎉")));
+    });
   },
 };
 
