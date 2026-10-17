@@ -1,25 +1,85 @@
+import hmac
+import os
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import monitor
+from clusters import cluster_var, get_cluster, load_clusters
 from vault import (call, cert_info, clean_namespace, clean_path, expiry_status, list_keys,
                    namespace_var, parse_policy, parse_time, readonly, tls_verify, vault_addr, walk_kv)
 
-app = FastAPI(title="Vault Dashboard")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    stop = monitor.start(scan_expiry)
+    yield
+    if stop:
+        stop.set()
 
 
-# Async so the ContextVar is set in the request's context, which sync endpoints inherit.
+app = FastAPI(title="Vault Dashboard", lifespan=lifespan)
+
+
+# Async so the ContextVars are set in the request's context, which sync endpoints inherit.
+async def select_cluster(x_vault_cluster: str | None = Header(default=None)) -> None:
+    cluster = get_cluster(x_vault_cluster)
+    if cluster is None:
+        raise HTTPException(400, "Unknown cluster")
+    cluster_var.set(cluster)
+    namespace_var.set(cluster.namespace)
+
+
 async def token(x_vault_token: str | None = Header(default=None),
-                x_vault_namespace: str | None = Header(default=None)) -> str:
+                x_vault_namespace: str | None = Header(default=None),
+                _: None = Depends(select_cluster)) -> str:
     if not x_vault_token:
         raise HTTPException(401, "Missing Vault token")
-    namespace_var.set(clean_namespace(x_vault_namespace))
+    if x_vault_namespace is not None:
+        namespace_var.set(clean_namespace(x_vault_namespace))
     return x_vault_token
+
+
+@app.get("/api/clusters")
+def clusters():
+    """Configured clusters (names and addresses only; never tokens)."""
+    return {"clusters": [{"name": c.name, "addr": c.addr, "namespace": c.namespace,
+                          "monitored": bool(c.monitor_token)} for c in load_clusters()]}
+
+
+@app.get("/api/fleet")
+def fleet(t: str = Depends(token)):
+    """Health and expiry counts of every cluster. Needs a valid token on the selected cluster."""
+    call("GET", "auth/token/lookup-self", t)
+    clusters_cfg = load_clusters()
+    with ThreadPoolExecutor(max_workers=min(8, len(clusters_cfg))) as pool:
+        health = list(pool.map(monitor.cluster_health, clusters_cfg))
+    out = []
+    for c, h in zip(clusters_cfg, health):
+        cached = monitor.STATE.get(c.name, {})
+        scan = {k: cached[k] for k in ("counts", "notes", "items", "by_kind", "scan_error", "checked_at")
+                if k in cached}
+        out.append({"name": c.name, "addr": c.addr, "namespace": c.namespace,
+                    "monitored": bool(c.monitor_token), **scan, **h})
+    return {"clusters": out, "alerts_enabled": monitor.alerts_enabled(), "interval": monitor.interval()}
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics(request: Request):
+    """Prometheus metrics from the background monitor. Optional bearer token: VAULT_DASH_METRICS_TOKEN."""
+    expected = os.environ.get("VAULT_DASH_METRICS_TOKEN")
+    if expected and not hmac.compare_digest(request.headers.get("authorization", ""), f"Bearer {expected}"):
+        raise HTTPException(401, "Invalid metrics token")
+    return monitor.metrics_text()
+
 
 
 @app.get("/api/namespaces")
@@ -34,7 +94,7 @@ def namespaces(t: str = Depends(token)):
 
 
 @app.get("/api/health")
-def health():
+def health(_: None = Depends(select_cluster)):
     url = f"{vault_addr()}/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200"
     try:
         data = httpx.get(url, timeout=5, verify=tls_verify()).json()
@@ -255,6 +315,10 @@ def audit(stale_days: int = 90, t: str = Depends(token)):
 @app.get("/api/expiry")
 def expiry(warn_days: int = 30, t: str = Depends(token)):
     """Expiry of tokens, PKI certificates and AppRole secret IDs."""
+    return scan_expiry(t, warn_days)
+
+
+def scan_expiry(t: str, warn_days: int = 30) -> dict:
     now = datetime.now(timezone.utc)
     items: list[dict] = []
     notes: list[str] = []

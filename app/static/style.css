@@ -75,5 +75,8 @@ pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px
 }
 
 .ns { padding: 10px; border-top: 1px solid var(--border); }
+.ns select { font-size: 13px; padding: 7px 10px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; text-transform: none; letter-spacing: 0; }
+.login .box select { width: 100%; padding: 9px 12px; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 8px; }
+.login .ns { padding: 0 0 10px; border: 0; }
 .ns label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
 .ns input { font-size: 13px; padding: 7px 10px; text-transform: none; letter-spacing: 0; }

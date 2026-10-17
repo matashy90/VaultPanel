@@ -1,0 +1,14 @@
+[
+  {
+    "name": "prod",
+    "addr": "https://vault-prod.example.com:8200",
+    "cacert": "/certs/ca.pem",
+    "namespace": "admin",
+    "monitor_token_env": "VAULT_TOKEN_PROD"
+  },
+  {
+    "name": "staging",
+    "addr": "https://vault-staging.example.com:8200",
+    "monitor_token_file": "/run/secrets/vault_token_staging"
+  }
+]

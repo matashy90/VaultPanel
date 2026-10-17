@@ -134,3 +134,97 @@ def test_namespace_header_and_ca_are_sent(monkeypatch):
     assert "X-Vault-Namespace" not in seen[-1][1] and seen[-1][2] is True
 
     assert client.get("/api/me", headers={**h, "X-Vault-Namespace": "../x"}).status_code == 400
+
+
+def write_clusters(tmp_path, monkeypatch, entries):
+    import json
+
+    f = tmp_path / "clusters.json"
+    f.write_text(json.dumps(entries))
+    monkeypatch.setenv("VAULT_CLUSTERS_FILE", str(f))
+
+
+def test_clusters_file_and_per_cluster_routing(monkeypatch, tmp_path):
+    import httpx
+
+    monkeypatch.setenv("TOK_B", "svc-b")
+    write_clusters(tmp_path, monkeypatch, [
+        {"name": "a", "addr": "https://a.example:8200/"},
+        {"name": "b", "addr": "https://b.example:8200", "cacert": "/ca-b.pem", "namespace": "admin",
+         "monitor_token_env": "TOK_B"}])
+    listed = client.get("/api/clusters").json()["clusters"]
+    assert [c["name"] for c in listed] == ["a", "b"] and listed[1]["monitored"] and not listed[0]["monitored"]
+    assert "svc-b" not in client.get("/api/clusters").text
+
+    seen = []
+
+    def fake(method, url, **kw):
+        seen.append((url, kw["headers"], kw["verify"]))
+        return httpx.Response(200, json={"data": {}}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx, "request", fake)
+    client.get("/api/me", headers={"X-Vault-Token": "t", "X-Vault-Cluster": "b"})
+    url, headers, verify = seen[-1]
+    assert url.startswith("https://b.example:8200/") and verify == "/ca-b.pem"
+    assert headers["X-Vault-Namespace"] == "admin"
+    client.get("/api/me", headers={"X-Vault-Token": "t"})
+    assert seen[-1][0].startswith("https://a.example:8200/") and "X-Vault-Namespace" not in seen[-1][1]
+    assert client.get("/api/me", headers={"X-Vault-Token": "t", "X-Vault-Cluster": "zzz"}).status_code == 400
+
+
+def test_clusters_file_validation(monkeypatch, tmp_path):
+    from clusters import load_clusters
+
+    write_clusters(tmp_path, monkeypatch, [{"name": "a b", "addr": "https://x"}])
+    with pytest.raises(ValueError):
+        load_clusters()
+    write_clusters(tmp_path, monkeypatch, [{"name": "a", "addr": "https://x"}, {"name": "a", "addr": "https://y"}])
+    with pytest.raises(ValueError):
+        load_clusters()
+    write_clusters(tmp_path, monkeypatch, [{"name": "a", "addr": "ftp://x"}])
+    with pytest.raises(ValueError):
+        load_clusters()
+
+
+def test_fleet_requires_token():
+    assert client.get("/api/fleet").status_code == 401
+
+
+def test_monitor_alerts_only_on_new_problems(monkeypatch):
+    import monitor
+
+    sent = []
+    monkeypatch.setattr(monitor, "send_alert", lambda subject, lines: sent.append(lines))
+    monkeypatch.setattr(monitor, "alerts_enabled", lambda: True)
+    monitor._alerted.clear()
+    from datetime import datetime, timedelta, timezone
+
+    item = {"kind": "token", "name": "ci", "source": "acc", "status": "critical", "days_left": 2,
+            "expires": (datetime.now(timezone.utc) + timedelta(hours=50)).isoformat()}
+    down = {"name": "p", "up": False, "error": "boom", "checked_at": 0}
+    ok = {"name": "p", "up": True, "sealed": False, "items": [item], "checked_at": 0}
+
+    monitor.notify([down])
+    assert len(sent) == 1 and "unreachable" in sent[-1][0]
+    monitor.notify([down])
+    assert len(sent) == 1                       # same problem, no repeat
+    monitor.notify([ok])
+    assert len(sent) == 3                       # new expiry alert, then the recovery notice
+    assert "recovered" in sent[-1][0] and "expires in 2d" in sent[-2][0]
+    monitor.notify([ok])
+    assert len(sent) == 3
+
+
+def test_metrics_endpoint(monkeypatch):
+    import monitor
+
+    monitor.STATE.clear()
+    monitor.STATE["p"] = {"name": "p", "up": True, "sealed": False, "checked_at": 100.0,
+                          "by_kind": {"token": {"expired": 1, "critical": 0, "warning": 2, "ok": 3}}}
+    text = client.get("/metrics").text
+    assert 'vault_dash_cluster_up{cluster="p"} 1' in text
+    assert 'vault_dash_expiry_items{cluster="p",kind="token",status="warning"} 2' in text
+    monkeypatch.setenv("VAULT_DASH_METRICS_TOKEN", "s3")
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers={"Authorization": "Bearer s3"}).status_code == 200
+    monitor.STATE.clear()

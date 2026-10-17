@@ -1,5 +1,5 @@
 const $app = document.getElementById("app");
-const state = { view: "overview", health: null, me: null, mounts: null };
+const state = { view: "overview", health: null, me: null, mounts: null, clusters: [] };
 
 function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -15,14 +15,22 @@ function h(tag, attrs = {}, ...children) {
   return el;
 }
 
-const getToken = () => sessionStorage.getItem("vault_token");
-const getNs = () => sessionStorage.getItem("vault_ns") || "";
+// Token and namespace are kept per cluster, so switching clusters never leaks a token to another Vault.
+const getCluster = () => {
+  const saved = sessionStorage.getItem("vault_cluster");
+  return state.clusters.some((c) => c.name === saved) ? saved : (state.clusters[0] || {}).name || "";
+};
+const key = (k) => `${k}:${getCluster()}`;
+const getToken = () => sessionStorage.getItem(key("vault_token"));
+const getNs = () => sessionStorage.getItem(key("vault_ns")) || "";
+const setNs = (v) => (v ? sessionStorage.setItem(key("vault_ns"), v) : sessionStorage.removeItem(key("vault_ns")));
 
 async function api(path, opts = {}) {
   const res = await fetch(`/api${path}`, {
     method: opts.method || "GET",
     headers: {
       "X-Vault-Token": getToken() || "",
+      "X-Vault-Cluster": getCluster(),
       ...(getNs() ? { "X-Vault-Namespace": getNs() } : {}),
       ...(opts.body ? { "Content-Type": "application/json" } : {}),
     },
@@ -58,6 +66,20 @@ function copy(text, btn) {
   });
 }
 
+function clusterPicker() {
+  if (state.clusters.length < 2) return null;
+  return h("label", { class: "ns" }, "Cluster",
+    h("select", { onchange: (e) => switchCluster(e.target.value) },
+      state.clusters.map((c) => h("option", { value: c.name, selected: c.name === getCluster() }, c.name))));
+}
+
+async function switchCluster(name) {
+  sessionStorage.setItem("vault_cluster", name);
+  state.kvMount = state.kvPath = state.policy = null;
+  if (!getToken()) return renderLogin();
+  try { await boot(); } catch { renderLogin("Session expired, sign in again"); }
+}
+
 // ---------- Login ----------
 async function renderLogin(error) {
   let health;
@@ -65,15 +87,16 @@ async function renderLogin(error) {
   const input = h("input", { type: "password", placeholder: "Vault token", autofocus: true, required: true });
   const form = h("form", { onsubmit: async (e) => {
     e.preventDefault();
-    sessionStorage.setItem("vault_token", input.value);
+    sessionStorage.setItem(key("vault_token"), input.value);
     try {
       await boot();
     } catch (err) {
-      sessionStorage.removeItem("vault_token");
+      sessionStorage.removeItem(key("vault_token"));
       renderLogin(err.status === 403 || err.status === 401 ? "Invalid or expired token" : err.message);
     }
   } },
     error && h("div", { class: "error" }, error),
+    clusterPicker(),
     input,
     h("button", { class: "btn primary", type: "submit" }, "Sign in"),
   );
@@ -87,7 +110,7 @@ async function renderLogin(error) {
 }
 
 // ---------- Shell ----------
-const NAV = [["overview", "Overview"], ["secrets", "Secrets"], ["policies", "Policies"],
+const NAV = [["overview", "Overview"], ["fleet", "Fleet"], ["secrets", "Secrets"], ["policies", "Policies"],
   ["auth", "Auth methods"], ["leases", "Leases"], ["expiry", "Expiry"], ["audit", "Audit"]];
 
 function nsPicker() {
@@ -99,13 +122,13 @@ function nsPicker() {
     e.preventDefault();
     const prev = getNs();
     const value = input.value.trim().replace(/^\/+|\/+$/g, "");
-    if (value) sessionStorage.setItem("vault_ns", value); else sessionStorage.removeItem("vault_ns");
+    if (value) setNs(value); else setNs("");
     try {
       await loadContext();
       state.kvMount = state.kvPath = state.policy = null;
       render();
     } catch (err) {
-      if (prev) sessionStorage.setItem("vault_ns", prev); else sessionStorage.removeItem("vault_ns");
+      setNs(prev);
       await loadContext().catch(() => {});
       alert(`Namespace "${value}": ${err.message}`);
       render();
@@ -122,8 +145,9 @@ function shell(content) {
       h("div", { class: "brand" }, h("span", { class: "logo" }, "V"), "Vault"),
       nav,
       h("div", { class: "spacer" }),
+      clusterPicker(),
       nsPicker(),
-      h("div", { class: "conn" }, state.health.addr, h("br"), `v${state.health.version || "?"}`),
+      h("div", { class: "conn" }, `${getCluster()}`, h("br"), state.health.addr, h("br"), `v${state.health.version || "?"}`),
       h("button", { class: "nav-item", onclick: logout }, "Sign out"),
     ),
     h("main", {}, content));
@@ -135,8 +159,8 @@ function go(view) {
 }
 
 function logout() {
-  sessionStorage.removeItem("vault_token");
-  sessionStorage.removeItem("vault_ns");
+  sessionStorage.removeItem(key("vault_token"));
+  sessionStorage.removeItem(key("vault_ns"));
   renderLogin();
 }
 
@@ -311,6 +335,55 @@ const views = {
             h("td", { style: "color:var(--muted)" }, i.source),
             h("td", {}, `${fmtDate(i.expires)} (${when(i)})`)))))
           : h("p", { class: "empty" }, "Nothing with an expiry date found.")));
+  },
+
+  async fleet() {
+    const r = await api("/fleet");
+    const age = (ts) => {
+      const m = Math.round((Date.now() / 1000 - ts) / 60);
+      return m < 1 ? "just now" : `${m} min ago`;
+    };
+    const cards = r.clusters.map((c) => {
+      const status = !c.up ? ["unreachable", "bad"] : c.sealed ? ["sealed", "bad"] : [c.standby ? "standby" : "active", "ok"];
+      const counts = c.counts;
+      const worst = counts && (counts.expired + counts.critical) ? "bad" : counts && counts.warning ? "warn" : "ok";
+      return h("div", { class: "card" },
+        h("div", { class: "row between" },
+          h("h3", { style: "margin:0" }, c.name, " ", h("span", { class: `badge ${status[1]}` }, status[0]),
+            c.enterprise && h("span", { class: "badge", style: "margin-left:6px" }, "enterprise")),
+          h("button", { class: "btn", onclick: () => switchCluster(c.name) },
+            c.name === getCluster() ? "Current" : "Open")),
+        h("div", { style: "color:var(--muted);margin:6px 0 12px" },
+          c.addr, c.namespace ? ` · ns ${c.namespace}` : "", c.version ? ` · v${c.version}` : "",
+          !c.up && c.error ? ` · ${c.error}` : ""),
+        counts ? h("div", {},
+          h("div", { class: "row", style: "gap:8px;flex-wrap:wrap" },
+            h("span", { class: `badge ${counts.expired ? "bad" : "ok"}` }, `${counts.expired} expired`),
+            h("span", { class: `badge ${counts.critical ? "bad" : "ok"}` }, `${counts.critical} critical`),
+            h("span", { class: `badge ${counts.warning ? "warn" : "ok"}` }, `${counts.warning} warning`),
+            h("span", { class: "badge ok" }, `${counts.ok} healthy`),
+            h("span", { class: "badge" }, `overall: ${worst === "ok" ? "good" : worst === "warn" ? "attention" : "action needed"}`)),
+          h("div", { style: "color:var(--muted);margin-top:8px;font-size:12px" },
+            ["token", "certificate", "approle"].map((k) => {
+              const b = (c.by_kind || {})[k] || {};
+              return `${k}: ${(b.expired || 0) + (b.critical || 0)} urgent / ${b.warning || 0} warn   `;
+            }), ` · scanned ${age(c.checked_at)}`),
+          (c.items || []).slice(0, 5).map((i) => h("div", { style: "margin-top:6px" },
+            h("span", { class: `badge ${i.status === "warning" ? "warn" : "bad"}` }, i.status), " ",
+            `${i.kind} ${i.name} (${fmtDate(i.expires)})`)),
+          (c.notes || []).slice(0, 2).map((n) => h("div", { style: "color:var(--muted);margin-top:6px" }, "ℹ ", n)))
+          : h("p", { class: "empty", style: "margin:0" }, c.scan_error ? `Scan failed: ${c.scan_error}`
+            : c.monitored ? "Waiting for the first background scan…"
+            : "No monitoring token configured for this cluster; only health is checked."));
+    });
+    return h("div", {},
+      h("div", { class: "row between" }, h("h2", {}, "Fleet"),
+        h("button", { class: "btn", onclick: () => render() }, "Refresh")),
+      h("div", { class: "card", style: "color:var(--muted)" },
+        r.interval > 0 ? `Background checks every ${Math.round(r.interval / 60)} min. ` : "Background monitoring is disabled. ",
+        r.alerts_enabled ? "Alerts are sent for new expired/critical items and for clusters that go down or seal."
+          : "No alert channel configured (webhook or email)."),
+      cards);
   },
 
   async audit() {
@@ -509,10 +582,14 @@ async function loadContext() {
 }
 
 async function boot() {
+  if (!state.clusters.length) state.clusters = (await api("/clusters")).clusters;
   state.health = await api("/health");
   await loadContext();
   render();
 }
 
-if (getToken()) boot().catch(() => renderLogin("Session expired, sign in again"));
-else renderLogin();
+(async () => {
+  try { state.clusters = (await api("/clusters")).clusters; } catch {}
+  if (getToken()) boot().catch(() => renderLogin("Session expired, sign in again"));
+  else renderLogin();
+})();

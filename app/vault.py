@@ -7,18 +7,22 @@ from urllib.parse import quote
 import httpx
 from fastapi import HTTPException
 
+from clusters import cluster_var
+
 # Set per request by the auth dependency; read by call() for every Vault request.
 namespace_var: ContextVar[str] = ContextVar("vault_namespace", default="")
 NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_\-./]*$")
 
 
 def vault_addr() -> str:
-    return os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200").rstrip("/")
+    c = cluster_var.get()
+    return c.addr if c else os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200").rstrip("/")
 
 
 def tls_verify() -> bool | str:
-    """Path to a custom CA bundle (VAULT_CACERT), else the default trust store."""
-    return os.environ.get("VAULT_CACERT") or True
+    """The selected cluster's CA bundle, else VAULT_CACERT, else the default trust store."""
+    c = cluster_var.get()
+    return c.verify if c else (os.environ.get("VAULT_CACERT") or True)
 
 
 def clean_namespace(ns: str | None) -> str:

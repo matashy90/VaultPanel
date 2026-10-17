@@ -8,8 +8,16 @@ services:
       VAULT_DASH_READONLY: ${VAULT_DASH_READONLY:-0}
       # Custom CA for an internal Vault: uncomment this and the volume below.
       # VAULT_CACERT: /certs/ca.pem
+      # Several clusters + background monitoring: copy clusters.example.json to clusters.json,
+      # uncomment the lines below, and pass the monitoring tokens named in it (monitor_token_env).
+      # VAULT_CLUSTERS_FILE: /config/clusters.json
+      # VAULT_TOKEN_PROD: ${VAULT_TOKEN_PROD}
+      # VAULT_MONITOR_INTERVAL: 300
+      # VAULT_ALERT_WEBHOOK: ${VAULT_ALERT_WEBHOOK:-}
+      # VAULT_DASH_METRICS_TOKEN: ${VAULT_DASH_METRICS_TOKEN:-}
     # volumes:
     #   - ./ca.pem:/certs/ca.pem:ro
+    #   - ./clusters.json:/config/clusters.json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

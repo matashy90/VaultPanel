@@ -41,8 +41,30 @@ Uses `VAULT_ADDR` (default `http://host.docker.internal:8200`) and publishes on 
 ## Namespaces (Vault Enterprise / HCP)
 Type the namespace (e.g. `admin` or `admin/team-a`) in the sidebar field. It is sent as `X-Vault-Namespace` with every request, and child namespaces are suggested when the token can list them. Leave it empty for the root namespace. Open source Vault has no namespaces and ignores the header. Namespace support is covered by unit tests only; it has not been tried against an Enterprise or HCP instance.
 
-## Several Vaults
-One instance talks to one `VAULT_ADDR`. For several clusters run one instance per Vault on different ports.
+## Several Vaults (fleet monitoring)
+List the clusters in a JSON file and point `VAULT_CLUSTERS_FILE` at it (see [clusters.example.json](clusters.example.json)); without it a single cluster is taken from `VAULT_ADDR`.
+
+```json
+[{"name": "prod", "addr": "https://vault-prod:8200", "cacert": "/certs/ca.pem",
+  "namespace": "admin", "monitor_token_env": "VAULT_TOKEN_PROD"},
+ {"name": "staging", "addr": "https://vault-staging:8200", "monitor_token_file": "/run/secrets/vault_token_staging"}]
+```
+- **Cluster picker**: with 2+ clusters the login page and sidebar show a picker. Tokens and namespaces are stored per cluster in `sessionStorage` and sent only to the cluster they belong to.
+- **Fleet page**: health (active/standby/sealed/unreachable, version, enterprise) and expiry counts for every cluster, with the worst items.
+- **Background monitor**: every `VAULT_MONITOR_INTERVAL` seconds (default 300, `0` disables) each cluster is checked, and expiry is scanned when it has a monitoring token (`monitor_token_env` or `monitor_token_file`, never inline in the JSON). Give it a dedicated read-only token with [onepane-monitor.hcl](onepane-monitor.hcl). Listing token accessors needs `sudo` in Vault, which is why that policy has it on that single path. The monitor does not renew the token, so use a periodic token and renew it, or a long TTL.
+- **Alerts** fire once for each *new* expired/critical item, and when a cluster becomes unreachable or sealed (plus a recovery notice). They repeat only if the problem disappears and returns, or after a restart.
+- **Prometheus**: `GET /metrics` exposes `vault_dash_cluster_up`, `vault_dash_cluster_sealed`, `vault_dash_expiry_items{cluster,kind,status}` and `vault_dash_last_check_timestamp_seconds`. Set `VAULT_DASH_METRICS_TOKEN` to require `Authorization: Bearer <token>`.
+
+| Variable | Purpose |
+|---|---|
+| `VAULT_CLUSTERS_FILE` | JSON list of clusters (above). |
+| `VAULT_MONITOR_INTERVAL` | Seconds between background checks (default 300, minimum 30, `0` = off). |
+| `VAULT_ALERT_WEBHOOK` | URL that receives `{"text": ..., "lines": [...]}` (Slack/Mattermost-compatible). |
+| `VAULT_ALERT_SMTP_HOST`, `_PORT` (587), `_USER`, `_PASSWORD`, `_STARTTLS` (1) | SMTP server for email alerts. |
+| `VAULT_ALERT_EMAIL_FROM`, `VAULT_ALERT_EMAIL_TO` | Sender and comma-separated recipients. |
+| `VAULT_DASH_METRICS_TOKEN` | Optional bearer token for `/metrics`. |
+
+Fleet details are only served to someone holding a valid token on the selected cluster, but `/metrics` is open unless you set the token above. The dashboard itself has no login of its own: anyone who can reach the port can read what the monitoring tokens can see on the Fleet page after signing in with any valid token. Keep it on a trusted network.
 
 ## Security notes
 - Serve it over HTTPS (reverse proxy) if it is reachable beyond localhost; tokens travel in a request header.
