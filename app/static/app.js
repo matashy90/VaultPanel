@@ -17,11 +17,21 @@ function h(tag, attrs = {}, ...children) {
 
 const getToken = () => sessionStorage.getItem("vault_token");
 
-async function api(path) {
-  const res = await fetch(`/api${path}`, { headers: { "X-Vault-Token": getToken() || "" } });
+async function api(path, opts = {}) {
+  const res = await fetch(`/api${path}`, {
+    method: opts.method || "GET",
+    headers: {
+      "X-Vault-Token": getToken() || "",
+      ...(opts.body ? { "Content-Type": "application/json" } : {}),
+    },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
-    try { msg = (await res.json()).detail || msg; } catch {}
+    try {
+      const d = (await res.json()).detail;
+      msg = typeof d === "string" ? d : Array.isArray(d) ? d.map((x) => x.msg).join("; ") : msg;
+    } catch {}
     const err = new Error(msg);
     err.status = res.status;
     throw err;
@@ -76,7 +86,7 @@ async function renderLogin(error) {
 
 // ---------- Shell ----------
 const NAV = [["overview", "Overview"], ["secrets", "Secrets"], ["policies", "Policies"],
-  ["auth", "Auth methods"], ["leases", "Leases"]];
+  ["auth", "Auth methods"], ["leases", "Leases"], ["audit", "Audit"]];
 
 function shell(content) {
   const nav = NAV.map(([k, label]) =>
@@ -153,11 +163,14 @@ const views = {
       h("div", { class: "row", style: "margin-bottom:14px" },
         kvMounts.map(([k, m]) => h("button", {
           class: `btn ${k === selected ? "primary" : ""}`,
-          onclick: () => { state.kvMount = k; state.kvPath = ""; render(); },
+          onclick: () => { state.kvMount = k; state.kvPath = ""; state.kvSearch = ""; state.kvForm = null; render(); },
         }, `${k} (v${(m.options && m.options.version) || 1})`))),
+      secretToolbar(selected, path),
       crumbs(selected, path));
     const isFile = path && !path.endsWith("/");
-    if (isFile) root.append(await secretDetail(selected, path));
+    if (state.kvForm) root.append(await secretForm(selected, path));
+    else if (state.kvSearch) root.append(await secretSearch(selected));
+    else if (isFile) root.append(await secretDetail(selected, path));
     else root.append(await secretList(selected, path));
     return root;
   },
@@ -225,6 +238,31 @@ const views = {
       h("p", { class: "empty" }, "No leases at this level.")));
     return root;
   },
+  async audit() {
+    const days = state.staleDays || 90;
+    const r = await api(`/audit?${q({ stale_days: days })}`);
+    const counts = { high: 0, medium: 0, low: 0 };
+    r.findings.forEach((f) => counts[f.severity]++);
+    const tone = { high: "bad", medium: "warn", low: "" };
+    const select = h("select", { onchange: (e) => { state.staleDays = Number(e.target.value); render(); } },
+      [30, 90, 180, 365].map((d) => h("option", { value: d, selected: d === days }, `${d} days`)));
+    return h("div", {},
+      h("div", { class: "row between" }, h("h2", {}, "Audit"),
+        h("label", { class: "row", style: "color:var(--muted)" }, "Stale after", select)),
+      h("div", { class: "grid" },
+        stat("High", counts.high, counts.high ? "bad" : "ok"),
+        stat("Medium", counts.medium, counts.medium ? "warn" : "ok"),
+        stat("Low", counts.low),
+        stat("Checked", `${r.stats.policies} policies · ${r.stats.tokens} tokens · ${r.stats.secrets} secrets`)),
+      r.notes.map((n) => h("div", { class: "card", style: "color:var(--muted)" }, "ℹ ", n)),
+      h("div", { class: "card" }, r.findings.length ? h("table", {},
+        h("thead", {}, h("tr", {}, ["Severity", "Area", "Finding", "Details"].map((c) => h("th", {}, c)))),
+        h("tbody", {}, r.findings.map((f) => h("tr", {},
+          h("td", {}, h("span", { class: `badge ${tone[f.severity]}` }, f.severity)),
+          h("td", {}, f.category), h("td", {}, h("strong", {}, f.title)),
+          h("td", { style: "color:var(--muted)" }, f.detail)))))
+        : h("p", { class: "empty" }, "No issues found. 🎉")));
+  },
 };
 
 function stat(label, value, tone) {
@@ -238,11 +276,11 @@ function row(label, value) {
 function crumbs(mount, path) {
   const parts = path.split("/").filter(Boolean);
   return h("div", { class: "crumbs" },
-    h("a", { onclick: () => { state.kvPath = ""; render(); } }, mount),
+    h("a", { onclick: () => { state.kvPath = ""; state.kvForm = null; state.kvSearch = ""; render(); } }, mount),
     parts.map((p, i) => {
       const last = i === parts.length - 1 && !path.endsWith("/");
       const target = parts.slice(0, i + 1).join("/") + (last ? "" : "/");
-      return [" / ", h("a", { onclick: () => { state.kvPath = target; render(); } }, p)];
+      return [" / ", h("a", { onclick: () => { state.kvPath = target; state.kvForm = null; state.kvSearch = ""; render(); } }, p)];
     }));
 }
 
@@ -254,10 +292,114 @@ async function secretList(mount, path) {
       h("td", {}, k.endsWith("/") ? "📁 " : "🔑 ", h("code", {}, k)))))));
 }
 
+function dirOf(path) {
+  const i = path.lastIndexOf("/");
+  return i === -1 ? "" : path.slice(0, i + 1);
+}
+
+function secretToolbar(mount, path) {
+  const input = h("input", { placeholder: "Search paths in this mount…", value: state.kvSearch || "" });
+  const form = h("form", { class: "row", style: "flex:1", onsubmit: (e) => {
+    e.preventDefault();
+    state.kvSearch = input.value.trim();
+    state.kvForm = null;
+    render();
+  } }, input, h("button", { class: "btn", type: "submit" }, "Search"),
+    state.kvSearch && h("button", { class: "btn", type: "button",
+      onclick: () => { state.kvSearch = ""; render(); } }, "Clear"));
+  const newBtn = !state.health.readonly && h("button", { class: "btn primary", onclick: () => {
+    state.kvSearch = "";
+    state.kvForm = { mode: "new", dir: dirOf(path), data: {} };
+    render();
+  } }, "+ New secret");
+  return h("div", { class: "row", style: "margin-bottom:14px" }, form, newBtn);
+}
+
+async function secretSearch(mount) {
+  const r = await api(`/kv/search?${q({ mount, q: state.kvSearch })}`);
+  return h("div", { class: "card" },
+    h("h3", {}, `${r.results.length} match${r.results.length === 1 ? "" : "es"} for "${state.kvSearch}"`),
+    r.truncated && h("p", { class: "hint" }, `Only the first ${r.scanned} secrets were scanned.`),
+    r.results.length ? h("table", {}, h("tbody", {}, r.results.map((p) =>
+      h("tr", { class: "click", onclick: () => { state.kvSearch = ""; state.kvPath = p; render(); } },
+        h("td", {}, "🔑 ", h("code", {}, p))))))
+      : h("p", { class: "empty" }, "No matching secrets."));
+}
+
+async function secretForm(mount, path) {
+  const f = state.kvForm;
+  const isNew = f.mode === "new";
+  const originals = f.data;
+  const pathInput = h("input", { value: isNew ? f.dir : path, placeholder: "folder/secret-name",
+    disabled: isNew ? null : "disabled" });
+  const rowsEl = h("div", { style: "display:flex;flex-direction:column;gap:8px;width:100%" });
+  const addRow = (k = "", v = "") => {
+    const text = typeof v === "string" ? v : JSON.stringify(v);
+    const kInput = h("input", { placeholder: "key", value: k, class: "mono" });
+    const vInput = h("input", { placeholder: "value", value: text, class: "mono" });
+    const row = h("div", { class: "row" }, kInput, vInput,
+      h("button", { class: "btn", type: "button", onclick: () => row.remove() }, "✕"));
+    row.getKV = () => [kInput.value.trim(), vInput.value, k];
+    rowsEl.append(row);
+  };
+  Object.entries(originals).forEach(([k, v]) => addRow(k, v));
+  if (!Object.keys(originals).length) addRow();
+  const errBox = h("div", {});
+
+  const save = async (e) => {
+    e.preventDefault();
+    errBox.replaceChildren();
+    const data = {};
+    try {
+      for (const row of rowsEl.children) {
+        const [k, v, origKey] = row.getKV();
+        if (!k) continue;
+        if (k in data) throw new Error(`Duplicate key "${k}"`);
+        // Keep non-string values (numbers, objects) typed as they were.
+        data[k] = origKey && typeof originals[origKey] !== "string" && originals[origKey] !== undefined
+          ? JSON.parse(v) : v;
+      }
+      const target = pathInput.value.trim();
+      await api("/kv/write", { method: "POST", body: { mount, path: target, data } });
+      state.kvForm = null;
+      state.kvPath = target;
+      render();
+    } catch (err) {
+      errBox.replaceChildren(errorBox(err));
+    }
+  };
+
+  return h("form", { class: "card", style: "display:block", onsubmit: save },
+    h("h3", {}, isNew ? "New secret" : "Edit secret (saves a new version)"),
+    errBox,
+    h("label", { style: "display:block;margin-bottom:12px;color:var(--muted)" }, "Path", pathInput),
+    rowsEl,
+    h("div", { class: "row", style: "margin-top:14px" },
+      h("button", { class: "btn", type: "button", onclick: () => addRow() }, "+ Add key"),
+      h("div", { style: "flex:1" }),
+      h("button", { class: "btn", type: "button", onclick: () => { state.kvForm = null; render(); } }, "Cancel"),
+      h("button", { class: "btn primary", type: "submit" }, "Save")));
+}
+
 async function secretDetail(mount, path) {
   const s = await api(`/kv/read?${q({ mount, path })}`);
   const entries = Object.entries(s.data || {});
   const wrap = h("div", {});
+  if (!state.health.readonly) {
+    const v2 = s.kv_version === 2;
+    wrap.append(h("div", { class: "row", style: "margin-bottom:14px" },
+      h("button", { class: "btn", onclick: () => { state.kvForm = { mode: "edit", data: s.data || {} }; render(); } }, "Edit"),
+      h("button", { class: "btn", style: "color:var(--bad)", onclick: async () => {
+        const msg = v2 ? `Delete the latest version of "${path}"? It can be undeleted in Vault.`
+          : `Permanently delete "${path}"? This cannot be undone.`;
+        if (!confirm(msg)) return;
+        try {
+          await api(`/kv/delete?${q({ mount, path })}`, { method: "DELETE" });
+          state.kvPath = dirOf(path);
+          render();
+        } catch (e) { alert(e.message); }
+      } }, "Delete")));
+  }
   wrap.append(h("div", { class: "card" }, h("h3", {}, "Data"),
     entries.length ? h("table", {}, h("tbody", {}, entries.map(([k, v]) => {
       const text = typeof v === "string" ? v : JSON.stringify(v);

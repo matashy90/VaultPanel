@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
@@ -46,6 +47,46 @@ def list_keys(path: str, token: str) -> list[str]:
         raise
 
 
+def readonly() -> bool:
+    return os.environ.get("VAULT_DASH_READONLY", "").lower() in ("1", "true", "yes")
+
+
+def parse_time(value: str | None) -> datetime | None:
+    if not value or value.startswith("0001"):
+        return None
+    # Vault emits nanosecond precision, which fromisoformat rejects.
+    value = re.sub(r"(\.\d{6})\d+", r"\1", value).replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def walk_kv(mount: str, v2: bool, token: str, limit: int = 500, max_depth: int = 10):
+    """Returns (secret paths, truncated) by walking a KV mount's key tree."""
+    base = f"{mount}/metadata" if v2 else mount
+    found: list[str] = []
+    stack = [("", 0)]
+    while stack:
+        prefix, depth = stack.pop()
+        try:
+            keys = list_keys(f"{base}/{clean_path(prefix)}".rstrip("/") + "/", token)
+        except HTTPException as e:
+            if e.status_code == 403:
+                continue
+            raise
+        for k in sorted(keys, reverse=True):
+            if k.endswith("/"):
+                if depth < max_depth:
+                    stack.append((prefix + k, depth + 1))
+            else:
+                if len(found) >= limit:
+                    return sorted(found), True
+                found.append(prefix + k)
+    return sorted(found), False
+
+
 def parse_policy(hcl: str) -> list[dict]:
     """Extracts path blocks and their capabilities from an ACL policy."""
     rules = []
@@ -57,8 +98,10 @@ def parse_policy(hcl: str) -> list[dict]:
         body = hcl[m.end():i - 1]
         caps_match = re.search(r"capabilities\s*=\s*\[(.*?)\]", body, re.DOTALL)
         caps = re.findall(r'"(\w+)"', caps_match.group(1)) if caps_match else []
-        broad = "sudo" in caps or m.group(1) in ("*", "/*") or (
-            m.group(1).endswith("*") and "delete" in caps and "update" in caps
+        broad = not m.group(1).startswith("cubbyhole/") and (
+            "sudo" in caps or m.group(1) in ("*", "/*") or (
+                m.group(1).endswith("*") and "delete" in caps and "update" in caps
+            )
         )
         rules.append({"path": m.group(1), "capabilities": caps, "risky": broad})
     return rules

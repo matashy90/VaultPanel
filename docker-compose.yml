@@ -1,0 +1,11 @@
+services:
+  vault-dashboard:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      VAULT_ADDR: ${VAULT_ADDR:-http://host.docker.internal:8200}
+      VAULT_DASH_READONLY: ${VAULT_DASH_READONLY:-0}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
