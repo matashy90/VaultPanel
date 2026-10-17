@@ -16,12 +16,14 @@ function h(tag, attrs = {}, ...children) {
 }
 
 const getToken = () => sessionStorage.getItem("vault_token");
+const getNs = () => sessionStorage.getItem("vault_ns") || "";
 
 async function api(path, opts = {}) {
   const res = await fetch(`/api${path}`, {
     method: opts.method || "GET",
     headers: {
       "X-Vault-Token": getToken() || "",
+      ...(getNs() ? { "X-Vault-Namespace": getNs() } : {}),
       ...(opts.body ? { "Content-Type": "application/json" } : {}),
     },
     body: opts.body ? JSON.stringify(opts.body) : undefined,
@@ -88,6 +90,30 @@ async function renderLogin(error) {
 const NAV = [["overview", "Overview"], ["secrets", "Secrets"], ["policies", "Policies"],
   ["auth", "Auth methods"], ["leases", "Leases"], ["expiry", "Expiry"], ["audit", "Audit"]];
 
+function nsPicker() {
+  const input = h("input", { value: getNs(), placeholder: "root namespace", list: "ns-list",
+    title: "Vault Enterprise / HCP namespace, e.g. admin or admin/team-a" });
+  const list = h("datalist", { id: "ns-list" },
+    (state.namespaces || []).map((n) => h("option", { value: (getNs() ? getNs() + "/" : "") + n.replace(/\/$/, "") })));
+  const form = h("form", { class: "ns", onsubmit: async (e) => {
+    e.preventDefault();
+    const prev = getNs();
+    const value = input.value.trim().replace(/^\/+|\/+$/g, "");
+    if (value) sessionStorage.setItem("vault_ns", value); else sessionStorage.removeItem("vault_ns");
+    try {
+      await loadContext();
+      state.kvMount = state.kvPath = state.policy = null;
+      render();
+    } catch (err) {
+      if (prev) sessionStorage.setItem("vault_ns", prev); else sessionStorage.removeItem("vault_ns");
+      await loadContext().catch(() => {});
+      alert(`Namespace "${value}": ${err.message}`);
+      render();
+    }
+  } }, h("label", {}, "Namespace", input), list);
+  return form;
+}
+
 function shell(content) {
   const nav = NAV.map(([k, label]) =>
     h("button", { class: `nav-item ${state.view === k ? "active" : ""}`, onclick: () => go(k) }, label));
@@ -96,6 +122,7 @@ function shell(content) {
       h("div", { class: "brand" }, h("span", { class: "logo" }, "V"), "Vault"),
       nav,
       h("div", { class: "spacer" }),
+      nsPicker(),
       h("div", { class: "conn" }, state.health.addr, h("br"), `v${state.health.version || "?"}`),
       h("button", { class: "nav-item", onclick: logout }, "Sign out"),
     ),
@@ -109,6 +136,7 @@ function go(view) {
 
 function logout() {
   sessionStorage.removeItem("vault_token");
+  sessionStorage.removeItem("vault_ns");
   renderLogin();
 }
 
@@ -473,10 +501,16 @@ async function secretDetail(mount, path) {
 }
 
 // ---------- Boot ----------
+async function loadContext() {
+  const [me, mounts, ns] = await Promise.all([api("/me"), api("/mounts"), api("/namespaces")]);
+  state.me = me;
+  state.mounts = mounts;
+  state.namespaces = ns.namespaces;
+}
+
 async function boot() {
   state.health = await api("/health");
-  state.me = await api("/me");
-  state.mounts = await api("/mounts");
+  await loadContext();
   render();
 }
 

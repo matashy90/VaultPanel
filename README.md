@@ -29,13 +29,20 @@ Open http://127.0.0.1:8080 and sign in with a Vault token. Quick local try-out: 
 ```
 docker compose up --build
 ```
-Uses `VAULT_ADDR` (default `http://host.docker.internal:8200`) and publishes on `127.0.0.1:8080` only. The Docker setup has not been built or tested yet.
+Uses `VAULT_ADDR` (default `http://host.docker.internal:8200`) and publishes on `127.0.0.1:8080` only. Built and tested with Docker Engine 29 against a Vault 1.18 container; for an internal CA see `VAULT_CACERT` in `docker-compose.yml`.
 
 ## Configuration
 | Variable | Purpose |
 |---|---|
 | `VAULT_ADDR` | Vault address (default `http://127.0.0.1:8200`). |
+| `VAULT_CACERT` | Path to a CA bundle (PEM) for a Vault with an internal/private TLS certificate. |
 | `VAULT_DASH_READONLY` | `1` disables create/edit/delete in the API and hides the buttons. |
+
+## Namespaces (Vault Enterprise / HCP)
+Type the namespace (e.g. `admin` or `admin/team-a`) in the sidebar field. It is sent as `X-Vault-Namespace` with every request, and child namespaces are suggested when the token can list them. Leave it empty for the root namespace. Open source Vault has no namespaces and ignores the header. Namespace support is covered by unit tests only; it has not been tried against an Enterprise or HCP instance.
+
+## Several Vaults
+One instance talks to one `VAULT_ADDR`. For several clusters run one instance per Vault on different ports.
 
 ## Security notes
 - Serve it over HTTPS (reverse proxy) if it is reachable beyond localhost; tokens travel in a request header.

@@ -73,3 +73,7 @@ pre { background: var(--bg); border: 1px solid var(--border); border-radius: 8px
   .sidebar { position: static; height: auto; flex-direction: row; flex-wrap: wrap; }
   main { padding: 18px; }
 }
+
+.ns { padding: 10px; border-top: 1px solid var(--border); }
+.ns label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.ns input { font-size: 13px; padding: 7px 10px; text-transform: none; letter-spacing: 0; }

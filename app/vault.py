@@ -1,14 +1,31 @@
 import os
 import re
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from urllib.parse import quote
 
 import httpx
 from fastapi import HTTPException
 
+# Set per request by the auth dependency; read by call() for every Vault request.
+namespace_var: ContextVar[str] = ContextVar("vault_namespace", default="")
+NAMESPACE_RE = re.compile(r"^[A-Za-z0-9_\-./]*$")
+
 
 def vault_addr() -> str:
     return os.environ.get("VAULT_ADDR", "http://127.0.0.1:8200").rstrip("/")
+
+
+def tls_verify() -> bool | str:
+    """Path to a custom CA bundle (VAULT_CACERT), else the default trust store."""
+    return os.environ.get("VAULT_CACERT") or True
+
+
+def clean_namespace(ns: str | None) -> str:
+    ns = (ns or "").strip().strip("/")
+    if ".." in ns.split("/") or not NAMESPACE_RE.match(ns):
+        raise HTTPException(400, "Invalid namespace")
+    return ns
 
 
 def clean_path(path: str) -> str:
@@ -25,8 +42,11 @@ def clean_path(path: str) -> str:
 
 def call(method: str, path: str, token: str, json: dict | None = None) -> dict:
     url = f"{vault_addr()}/v1/{path}"
+    headers = {"X-Vault-Token": token}
+    if namespace_var.get():
+        headers["X-Vault-Namespace"] = namespace_var.get()
     try:
-        r = httpx.request(method, url, headers={"X-Vault-Token": token}, json=json, timeout=10)
+        r = httpx.request(method, url, headers=headers, json=json, timeout=10, verify=tls_verify())
     except httpx.HTTPError as e:
         raise HTTPException(502, f"Cannot reach Vault at {vault_addr()}: {e}")
     if r.status_code >= 400:

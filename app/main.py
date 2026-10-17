@@ -7,23 +7,37 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from vault import (call, cert_info, clean_path, expiry_status, list_keys, parse_policy, parse_time,
-                   readonly, vault_addr, walk_kv)
+from vault import (call, cert_info, clean_namespace, clean_path, expiry_status, list_keys,
+                   namespace_var, parse_policy, parse_time, readonly, tls_verify, vault_addr, walk_kv)
 
 app = FastAPI(title="Vault Dashboard")
 
 
-def token(x_vault_token: str | None = Header(default=None)) -> str:
+# Async so the ContextVar is set in the request's context, which sync endpoints inherit.
+async def token(x_vault_token: str | None = Header(default=None),
+                x_vault_namespace: str | None = Header(default=None)) -> str:
     if not x_vault_token:
         raise HTTPException(401, "Missing Vault token")
+    namespace_var.set(clean_namespace(x_vault_namespace))
     return x_vault_token
+
+
+@app.get("/api/namespaces")
+def namespaces(t: str = Depends(token)):
+    """Child namespaces of the current namespace (Vault Enterprise / HCP only)."""
+    try:
+        return {"namespaces": sorted(list_keys("sys/namespaces", t))}
+    except HTTPException as e:
+        if e.status_code in (400, 403, 404):
+            return {"namespaces": []}
+        raise
 
 
 @app.get("/api/health")
 def health():
     url = f"{vault_addr()}/v1/sys/health?standbyok=true&sealedcode=200&uninitcode=200"
     try:
-        data = httpx.get(url, timeout=5).json()
+        data = httpx.get(url, timeout=5, verify=tls_verify()).json()
     except (httpx.HTTPError, ValueError) as e:
         return {"addr": vault_addr(), "reachable": False, "error": str(e), "readonly": readonly()}
     return {"addr": vault_addr(), "reachable": True, "readonly": readonly(), **data}

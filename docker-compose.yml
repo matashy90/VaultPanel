@@ -6,6 +6,10 @@ services:
     environment:
       VAULT_ADDR: ${VAULT_ADDR:-http://host.docker.internal:8200}
       VAULT_DASH_READONLY: ${VAULT_DASH_READONLY:-0}
+      # Custom CA for an internal Vault: uncomment this and the volume below.
+      # VAULT_CACERT: /certs/ca.pem
+    # volumes:
+    #   - ./ca.pem:/certs/ca.pem:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

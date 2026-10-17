@@ -98,3 +98,39 @@ def test_expiry_status_and_cert_info():
 
 def test_expiry_requires_token():
     assert client.get("/api/expiry").status_code == 401
+
+
+def test_namespace_validation():
+    from vault import clean_namespace
+
+    assert clean_namespace("/admin/team-a/") == "admin/team-a"
+    assert clean_namespace(None) == "" and clean_namespace("") == ""
+    for bad in ("../x", "a/../b", "a b", "a?b", "a\nb"):
+        with pytest.raises(HTTPException):
+            clean_namespace(bad)
+
+
+def test_namespace_header_and_ca_are_sent(monkeypatch):
+    import httpx
+    import vault
+
+    seen = []
+
+    def fake(method, url, **kw):
+        seen.append((url, kw["headers"], kw["verify"]))
+        return httpx.Response(200, json={"data": {"policies": ["default"]}}, request=httpx.Request(method, url))
+
+    monkeypatch.setattr(httpx, "request", fake)
+    monkeypatch.setenv("VAULT_CACERT", "/etc/ca.pem")
+    h = {"X-Vault-Token": "t", "X-Vault-Namespace": "/admin/team-a/"}
+    assert client.get("/api/me", headers=h).status_code == 200
+    url, headers, verify = seen[-1]
+    assert headers["X-Vault-Namespace"] == "admin/team-a" and headers["X-Vault-Token"] == "t"
+    assert verify == "/etc/ca.pem"
+
+    # No namespace header means none is forwarded, and a previous request's value must not leak.
+    monkeypatch.delenv("VAULT_CACERT")
+    client.get("/api/me", headers={"X-Vault-Token": "t"})
+    assert "X-Vault-Namespace" not in seen[-1][1] and seen[-1][2] is True
+
+    assert client.get("/api/me", headers={**h, "X-Vault-Namespace": "../x"}).status_code == 400
