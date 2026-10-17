@@ -6,14 +6,17 @@ A clean web UI for HashiCorp Vault: browse and edit secrets, inspect policies, l
 - **Secrets**: KV v1/v2 browser with masked values (reveal/copy), version history, **path search**, and **create / edit / delete**. In KV v2, delete is a soft delete of the latest version and editing saves a new version.
 - **Policies**: parsed rules per path with capabilities. Broad rules (`sudo`, `*`, write+delete on wildcards) are flagged.
 - **Auth methods** and **Leases**: list backends, browse lease prefixes with TTL/expiry.
-- **Expiry**: one list of everything that expires, sorted by date, with expired / critical (≤7d) / warning (configurable window) status and a counter on the Overview page.
+- **Expiry**: one list of everything that expires, sorted by date, with expired / critical (≤7d) / warning (configurable window) status and a counter on the Overview page. Runs as a rate-limited background scan.
   - **Tokens**: from token accessors (`expire_time`).
   - **Certificates**: every non-revoked certificate and the issuing CA of each PKI mount (parsed from the PEM).
   - **AppRole**: secret IDs of each role. A role-id itself never expires, so roles whose secret IDs never expire are listed in the notes instead.
-  - Checks are capped (200 tokens, 200 certs per mount, 100 roles, 100 secret IDs per role) and the page says when something was skipped.
-- **Audit**: scans for root tokens, tokens without expiry, overly broad policy rules and stale KV v2 secrets (configurable age). Limited to what the signed-in token may read; skipped areas are listed.
+  - Scans are capped (see [Large clusters](#large-clusters-audit-and-expiry-scans)) and the page says when something was skipped.
+- **Audit**: scans for root tokens, tokens without expiry, overly broad policy rules and stale KV v2 secrets (configurable age), across all namespaces. Limited to what the signed-in token may read; skipped areas are listed.
 
-The browser holds your Vault token only in `sessionStorage`. The backend is a thin proxy that forwards it per request and stores nothing.
+- **Fleet**: health and expiry counts of several Vault clusters, with background monitoring, alerts (webhook, Teams, email) and Prometheus metrics.
+- **Sign-in**: Vault token, and optionally OIDC through Vault's OIDC auth method.
+
+The browser holds your Vault token only in `sessionStorage`. The backend forwards it per request; it only keeps scan results in memory, keyed by a hash of the token. Monitoring tokens (Fleet) come from environment variables or files.
 
 ## Run
 Python 3.10+:
@@ -23,7 +26,7 @@ python -m venv .venv
 set VAULT_ADDR=http://127.0.0.1:8200
 .venv\Scripts\uvicorn main:app --app-dir app --port 8080
 ```
-Open http://127.0.0.1:8080 and sign in with a Vault token. Quick local try-out: `vault server -dev -dev-root-token-id=root`, then sign in with token `root`.
+Open http://127.0.0.1:8080 and sign in with a Vault token (or OIDC, see below). Quick local try-out: `vault server -dev -dev-root-token-id=root`, then sign in with token `root`.
 
 ### Docker
 ```
@@ -37,6 +40,14 @@ Uses `VAULT_ADDR` (default `http://host.docker.internal:8200`) and publishes on 
 | `VAULT_ADDR` | Vault address (default `http://127.0.0.1:8200`). |
 | `VAULT_CACERT` | Path to a CA bundle (PEM) for a Vault with an internal/private TLS certificate. |
 | `VAULT_DASH_READONLY` | `1` disables create/edit/delete in the API and hides the buttons. |
+| `VAULT_OIDC_MOUNT`, `VAULT_OIDC_ROLE` | Enable OIDC sign-in (see [OIDC login](#oidc-login)). |
+| `VAULT_LOGIN_TOKEN` | `off` hides the token sign-in when OIDC is configured. |
+| `VAULT_CLUSTERS_FILE`, `VAULT_MONITOR_INTERVAL`, `VAULT_ALERT_*`, `VAULT_DASH_METRICS_TOKEN` | Several clusters, monitoring and alerts (see below). |
+| `VAULT_SCAN_*` | Limits of the audit/expiry scans (see [Large clusters](#large-clusters-audit-and-expiry-scans)). |
+| `VAULT_OIDC_MOUNT`, `VAULT_OIDC_ROLE` | Enable OIDC sign-in (see [OIDC login](#oidc-login)). |
+| `VAULT_LOGIN_TOKEN` | `off` hides the token sign-in when OIDC is configured. |
+| `VAULT_CLUSTERS_FILE`, `VAULT_MONITOR_INTERVAL`, `VAULT_ALERT_*`, `VAULT_DASH_METRICS_TOKEN` | Several clusters, monitoring and alerts (see below). |
+| `VAULT_SCAN_*` | Limits of the audit/expiry scans (see [Large clusters](#large-clusters-audit-and-expiry-scans)). |
 
 ## Namespaces (Vault Enterprise / HCP)
 Type the namespace (e.g. `admin` or `admin/team-a`) in the sidebar field. It is sent as `X-Vault-Namespace` with every request, and child namespaces are suggested when the token can list them. Leave it empty for the root namespace. Open source Vault has no namespaces and ignores the header. Namespace support is covered by unit tests only; it has not been tried against an Enterprise or HCP instance.
@@ -66,7 +77,7 @@ List the clusters in a JSON file and point `VAULT_CLUSTERS_FILE` at it (see [clu
 - **Fleet page**: health (active/standby/sealed/unreachable, version, enterprise) and expiry counts for every cluster, with the worst items.
 - **Background monitor**: every `VAULT_MONITOR_INTERVAL` seconds (default 300, `0` disables) each cluster is checked, and expiry is scanned when it has a monitoring token (`monitor_token_env` or `monitor_token_file`, never inline in the JSON). Give it a dedicated read-only token with [onepane-monitor.hcl](onepane-monitor.hcl). Listing token accessors needs `sudo` in Vault, which is why that policy has it on that single path. The monitor does not renew the token, so use a periodic token and renew it, or a long TTL.
 - **Alerts** fire once for each *new* expired/critical item, and when a cluster becomes unreachable or sealed (plus a recovery notice). They repeat only if the problem disappears and returns, or after a restart.
-- **Prometheus**: `GET /metrics` exposes `vault_dash_cluster_up`, `vault_dash_cluster_sealed`, `vault_dash_expiry_items{cluster,kind,status}` and `vault_dash_last_check_timestamp_seconds`. Set `VAULT_DASH_METRICS_TOKEN` to require `Authorization: Bearer <token>`.
+- **Prometheus**: `GET /metrics` exposes `vault_dash_cluster_up`, `vault_dash_cluster_sealed`, `vault_dash_expiry_items{cluster,kind,status}` and `vault_dash_last_check_timestamp_seconds`. Set `VAULT_DASH_METRICS_TOKEN` to require a bearer token in the `Authorization` header. Scans use the same throttled scanner as the Expiry page (see [Large clusters](#large-clusters-audit-and-expiry-scans)). Bearer <token>`.
 
 | Variable | Purpose |
 |---|---|
@@ -102,6 +113,8 @@ Audit and Expiry run as background jobs with a rate limit, so they cannot flood 
 | `VAULT_SCAN_MAX_SECRETS` | 5000 | Secrets per KV v2 mount |
 | `VAULT_SCAN_MAX_CERTS` | 1000 | Certificates per PKI mount |
 | `VAULT_SCAN_MAX_ROLES` / `VAULT_SCAN_MAX_SECRET_IDS` | 500 / 100 | AppRole roles / secret IDs per role |
+
+Expiry lists only items that expire within 90 days (the rest are counted), and stale-secret findings are capped at 500. Listing token accessors is a single Vault call that is not paged, so with hundreds of thousands of tokens it is heavy and only the first `VAULT_SCAN_MAX_TOKENS` are checked; for such sizes scan once a day (`VAULT_MONITOR_INTERVAL=86400`), raise `VAULT_SCAN_MAX_TOKENS` and `VAULT_SCAN_BUDGET`, and use Vault's own metrics for totals. This has been measured only on small test data, not on clusters of that size.
 
 Advice: start with `VAULT_SCAN_RPS=10`, raise it while watching Vault's own metrics, and set `VAULT_MONITOR_INTERVAL=3600` or more for the background monitor. Measured on a local dev Vault at 40 req/s: 408 tokens + 502 secrets in about 24 s.
 
